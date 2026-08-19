@@ -7,6 +7,8 @@
 //!   * Route Slint callbacks to the right domain module.
 mod auth_dialogs;
 mod core;
+#[cfg(windows)]
+mod jump_list;
 pub mod launch;
 mod port_forward;
 mod quick_commands;
@@ -462,6 +464,13 @@ pub fn run(intent: crate::app::launch::LaunchIntent) -> Result<()> {
     // `meatshell.desktop` entry and show our icon in the dock/taskbar.  (On
     // Windows the icon comes from the embedded .ico, so this is a no-op there.)
     let _ = slint::set_xdg_app_id("meatshell");
+
+    // Taskbar jump list ("新建窗口") on Windows: register before the first
+    // window shows so the entry is available immediately. Failure is
+    // warn-only and never blocks startup.
+    #[cfg(windows)]
+    crate::app::jump_list::register_new_window_task();
+
     open_window(core.clone(), false)?;
 
     // Global loop: window.run() returns when *its* window closes, which is
