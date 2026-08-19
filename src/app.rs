@@ -16,6 +16,7 @@ mod session_runtime;
 mod sftp_callbacks;
 mod sftp_ui;
 mod sidebar;
+mod single_instance;
 mod tab_callbacks;
 mod terminal_ui;
 mod webdav;
