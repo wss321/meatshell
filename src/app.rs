@@ -6,6 +6,7 @@
 //!   * Manage the tab list + per-tab `SessionHandle` map.
 //!   * Route Slint callbacks to the right domain module.
 mod auth_dialogs;
+mod core;
 pub mod launch;
 mod port_forward;
 mod quick_commands;
