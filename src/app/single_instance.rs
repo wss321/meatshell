@@ -1,16 +1,24 @@
 // Single-instance coordination. All OS entry points (Windows jump list,
 // macOS dock menu, Linux desktop action) launch `meatshell --new-window`.
-// The first running instance owns a local socket under the data dir; later
+// The first running instance owns a local endpoint under the data dir; later
 // launches connect, send "new-window\n" and exit, and the primary opens the
 // new window in-process (Chrome-style).
+//
+// Transport split: unix uses a unix-domain socket (`ipc.sock`); Windows uses
+// a TCP loopback listener on 127.0.0.1 whose port is published in a port
+// file (`ipc.port`), because std's Windows unix-socket support is unstable
+// (nightly-only, rust-lang/rust#150487). On Windows every `socket_path`
+// argument is therefore reinterpreted as the port-file path.
 
-use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
-
+#[cfg(windows)]
+use std::net::{SocketAddr, TcpListener, TcpStream};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 #[cfg(windows)]
-use std::os::windows::net::{UnixListener, UnixStream};
+use std::time::Duration;
+
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 
 const MSG_NEW_WINDOW: &str = "new-window";
 
@@ -25,43 +33,89 @@ pub enum Instance {
 /// Try to become the primary instance; if one already exists, forward a
 /// new-window request to it. Never panics on IO trouble — callers treat
 /// errors as "just run normally".
+#[cfg(unix)]
 pub fn acquire(socket_path: &Path) -> std::io::Result<Instance> {
     match UnixListener::bind(socket_path) {
         Ok(listener) => Ok(Instance::Primary {
             listen: Listener { listener },
         }),
-        Err(_) if cfg!(windows) => {
-            // On Windows a leftover socket file from a crash blocks bind.
-            // If connecting fails too, remove the stale file and retry once.
-            if UnixStream::connect(socket_path).is_err() {
-                let _ = std::fs::remove_file(socket_path);
-                if let Ok(listener) = UnixListener::bind(socket_path) {
-                    return Ok(Instance::Primary {
-                        listen: Listener { listener },
-                    });
-                }
-            }
-            // A live primary exists: forward to it.
-            forward(socket_path)
-        }
-        Err(_) => forward(socket_path),
+        Err(_) => forward_unix(socket_path),
     }
 }
 
-fn forward(socket_path: &Path) -> std::io::Result<Instance> {
+/// `socket_path` is the port-file path here (see module docs).
+#[cfg(windows)]
+pub fn acquire(socket_path: &Path) -> std::io::Result<Instance> {
+    let port_file = socket_path;
+    // A live primary? Connect with a short timeout; a stale port file
+    // (parse error, refused/timeout connection) is treated as "no primary".
+    if let Some(port) = read_port_file(port_file) {
+        if forward_tcp(port).is_ok() {
+            return Ok(Instance::Forwarded);
+        }
+    }
+    // No live primary: start one on an ephemeral loopback port.
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    // Without the port file nobody can find us; let the caller fall back
+    // to a normal launch.
+    std::fs::write(port_file, port.to_string())?;
+    // Two processes can both see "no primary" and both reach this point.
+    // Whoever wrote the port file last wins; re-check and defer if we lost.
+    if read_port_file(port_file) != Some(port) {
+        drop(listener);
+        if let Some(winner) = read_port_file(port_file) {
+            if forward_tcp(winner).is_ok() {
+                return Ok(Instance::Forwarded);
+            }
+        }
+        return Err(std::io::Error::other("lost single-instance race"));
+    }
+    Ok(Instance::Primary {
+        listen: Listener { listener },
+    })
+}
+
+#[cfg(unix)]
+fn forward_unix(socket_path: &Path) -> std::io::Result<Instance> {
     let mut stream = UnixStream::connect(socket_path)?;
     stream.write_all(format!("{MSG_NEW_WINDOW}\n").as_bytes())?;
     stream.flush()?;
     Ok(Instance::Forwarded)
 }
 
-/// Endpoint path inside the per-user data dir.
+#[cfg(windows)]
+fn forward_tcp(port: u16) -> std::io::Result<Instance> {
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(300))?;
+    stream.write_all(format!("{MSG_NEW_WINDOW}\n").as_bytes())?;
+    stream.flush()?;
+    Ok(Instance::Forwarded)
+}
+
+#[cfg(windows)]
+fn read_port_file(port_file: &Path) -> Option<u16> {
+    std::fs::read_to_string(port_file).ok()?.trim().parse().ok()
+}
+
+/// Endpoint path inside the per-user data dir: the unix socket on unix, the
+/// TCP port file on Windows (see module docs).
 pub fn socket_path() -> PathBuf {
-    crate::config::data_dir().join("ipc.sock")
+    #[cfg(windows)]
+    {
+        crate::config::data_dir().join("ipc.port")
+    }
+    #[cfg(not(windows))]
+    {
+        crate::config::data_dir().join("ipc.sock")
+    }
 }
 
 pub struct Listener {
+    #[cfg(unix)]
     listener: UnixListener,
+    #[cfg(windows)]
+    listener: TcpListener,
 }
 
 impl Listener {

@@ -1,11 +1,12 @@
 use crate::app::single_instance::{acquire, Instance};
 use std::sync::mpsc;
 
-/// Per-pid dir, per-test socket filename. Cargo runs tests in the same
-/// process (separate threads), so a shared `ipc.sock` would let one test's
+/// Per-pid dir, per-test endpoint filename. Cargo runs tests in the same
+/// process (separate threads), so a shared endpoint would let one test's
 /// primary answer another test's acquire; the distinct names keep each test
-/// deterministic. The pre-remove also guards against a stale socket file
-/// from an earlier run under a reused pid.
+/// deterministic. The pre-remove also guards against a stale file from an
+/// earlier run under a reused pid. This is a unix-socket path on unix and a
+/// TCP port-file path on Windows (see `single_instance` module docs).
 fn temp_socket_path(test_name: &str) -> std::path::PathBuf {
     let n = std::process::id();
     let dir = std::env::temp_dir().join(format!("meatshell-si-{n}"));
