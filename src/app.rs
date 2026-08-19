@@ -2181,9 +2181,11 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
         let sh = sftp_handles.clone();
         let wheel_bufs = bufs.clone();
         let close_handles = handles.clone();
+        let close_sftp_handles = sftp_handles.clone();
         let ev_store = store.clone();
         let ev_activity = activity.clone();
         let ev_exit_confirmed = exit_confirmed.clone();
+        let ev_registry = registry.clone();
         let ev_window_size_tracking_ready = window_size_tracking_ready.clone();
         let ev_pending_window_size_restore = pending_window_size_restore.clone();
         let mut last_cursor_logical: Option<(f32, f32)> = None;
@@ -2476,6 +2478,27 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
                         if let Some(win) = weak.upgrade() {
                             save_layout(&win, &ev_store);
                         }
+                        // The event is not prevented, so Slint will destroy this
+                        // window. Mirror the confirmed custom-close path: tear down
+                        // this window's workers and unregister it, quitting the
+                        // shared event loop if it was the last one — otherwise a
+                        // stale registry entry blocks the quit of a later window.
+                        {
+                            let mut sessions = close_handles.borrow_mut();
+                            for handle in sessions.values() {
+                                handle.close();
+                            }
+                            sessions.clear();
+                        }
+                        if let Ok(mut sftp) = close_sftp_handles.lock() {
+                            for handle in sftp.values() {
+                                handle.close();
+                            }
+                            sftp.clear();
+                        }
+                        if ev_registry.unregister(window_id) {
+                            let _ = slint::quit_event_loop();
+                        }
                     }
                     _ => {}
                 }
@@ -2558,6 +2581,7 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
     {
         let weak = window.as_weak();
         let close_handles = handles.clone();
+        let close_sftp_handles = sftp_handles.clone();
         let wc_store = store.clone();
         let wc_exit_confirmed = exit_confirmed.clone();
         let wc_registry = registry.clone();
@@ -2575,6 +2599,12 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
                             handle.close();
                         }
                         sessions.clear();
+                    }
+                    if let Ok(mut sftp) = close_sftp_handles.lock() {
+                        for handle in sftp.values() {
+                            handle.close();
+                        }
+                        sftp.clear();
                     }
                     let _ = w.hide();
                     if wc_registry.unregister(window_id) {
