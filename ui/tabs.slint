@@ -175,6 +175,8 @@ export component TabBar inherits Rectangle {
     callback tab-selected(string);
     callback tab-closed(string);
     callback new-tab();
+    // Open an additional application window (multi-window entry point).
+    callback new-window();
     // Drag-to-reorder: move the tab at `from` one slot in `dir` (#v0.5).
     callback tab-reorder(int /* from */, int /* dir */);
     // Split this pane, peeling `tab-id` into a new pane on `dir` (#v0.5).
@@ -236,6 +238,17 @@ export component TabBar inherits Rectangle {
                     size: 28px;
                     y: (parent.height - self.height) / 2;
                     clicked => { root.new-tab(); }
+                }
+                // New-window entry point. Unlike "+" this stays visible even
+                // when the new-tab button is hidden (welcome-as-sidebar mode):
+                // a new window is still useful there (#multi-window).
+                IconButton {
+                    glyph: "\u{e89e}";   // Material "open_in_new"
+                    font-family: "Material Icons";
+                    tooltip: @tr("新建窗口");
+                    size: 28px;
+                    y: (parent.height - self.height) / 2;
+                    clicked => { root.new-window(); }
                 }
             }
         }

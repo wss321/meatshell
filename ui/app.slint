@@ -771,6 +771,7 @@ export component AppWindow inherits Window {
     callback tab-selected(string);
     callback tab-closed(string);
     callback new-tab-clicked();
+    callback new-window-clicked();   // open another application window (#multi-window)
     callback tab-reorder(int /* from-index */, int /* dir: -1 left / +1 right */);
     // Per-pane tab actions (v0.5): the int is the pane (leaf) id.
     callback pane-tab-selected(int /* pane-id */, string /* tab-id */);
@@ -1461,6 +1462,7 @@ export component AppWindow inherits Window {
                     tab-selected(id) => { root.pane-tab-selected(pane.id, id); }
                     tab-closed(id) => { root.pane-tab-closed(pane.id, id); }
                     new-tab() => { root.pane-new-tab(pane.id); }
+                    new-window() => { root.new-window-clicked(); }
                     tab-reorder(from-index, direction) => {
                         root.pane-tab-reorder(pane.id, from-index, direction);
                     }
@@ -1637,6 +1639,7 @@ export component AppWindow inherits Window {
                         root.diagnose-key-event(term.id, key, control, meta, alt, shift);
                     }
                     cycle-tab(reverse) => { root.cycle-tab(reverse); }
+                    new-window-key() => { root.new-window-clicked(); }
                     terminal-resize(w, h) => { root.terminal-resize(term.id, w, h) }
                     sftp-navigate(path) => { root.sftp-navigate(term.id, path); }
                     sftp-download(path) => { root.sftp-download(term.id, path); }

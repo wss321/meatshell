@@ -2095,6 +2095,19 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
         window.set_about_libs(ModelRc::from(Rc::new(VecModel::from(libs))));
     }
 
+    // New-window entry points: the TabBar button and the Ctrl+Shift+N /
+    // ⌘⇧N shortcut both route here. Runs on the UI thread (Slint callback),
+    // so open_window can build the window directly. A failed open must not
+    // be silent — the click/keystroke already consumed (#multi-window).
+    {
+        let core = core.clone();
+        window.on_new_window_clicked(move || {
+            if let Err(e) = open_window(core.clone(), true) {
+                tracing::warn!("failed to open new window: {e:#}");
+            }
+        });
+    }
+
     wire_tab_callbacks(
         &window,
         tabs_model.clone(),
