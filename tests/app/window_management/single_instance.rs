@@ -21,7 +21,8 @@ fn first_acquire_becomes_primary_and_second_forwards() {
     let path = temp_socket_path("first_acquire_becomes_primary_and_second_forwards");
     let (tx, rx) = mpsc::channel();
 
-    let instance = acquire(&path).expect("primary acquire");
+    // Plain launch: becomes the primary.
+    let instance = acquire(&path, false).expect("primary acquire");
     let Instance::Primary { listen } = instance else {
         panic!("first acquire must be primary");
     };
@@ -34,7 +35,8 @@ fn first_acquire_becomes_primary_and_second_forwards() {
     // Give the accept loop a moment to start.
     std::thread::sleep(std::time::Duration::from_millis(100));
 
-    match acquire(&path).expect("forward acquire") {
+    // `--new-window` launch: forwards to the primary.
+    match acquire(&path, true).expect("forward acquire") {
         Instance::Forwarded => {}
         Instance::Primary { .. } => panic!("second acquire must forward"),
     }
@@ -49,8 +51,57 @@ fn first_acquire_becomes_primary_and_second_forwards() {
 fn forwarding_without_primary_fails() {
     let path = temp_socket_path("forwarding_without_primary_fails");
     // No primary bound: acquire must become primary, not Forwarded.
-    match acquire(&path).expect("acquire") {
+    match acquire(&path, true).expect("acquire") {
         Instance::Primary { .. } => {}
         Instance::Forwarded => panic!("no primary to forward to"),
     }
+}
+
+/// A previous primary that exited without unlinking leaves a file behind.
+/// `UnixListener::bind` fails with EADDRINUSE for any existing file, so
+/// acquire must detect staleness via the failed connect probe, remove the
+/// file and take over the endpoint instead of erroring out.
+#[test]
+fn stale_socket_file_is_recovered() {
+    let path = temp_socket_path("stale_socket_file_is_recovered");
+    // A file with no listener behind it: stale endpoint.
+    std::fs::write(&path, b"stale").unwrap();
+    match acquire(&path, true).expect("acquire over a stale socket file") {
+        Instance::Primary { .. } => {}
+        Instance::Forwarded => panic!("nothing is listening behind a stale file"),
+    }
+}
+
+/// A plain second launch must not forward "new-window" to the primary
+/// (run() only honors `Forwarded` for `--new-window`, so forwarding would
+/// spawn a bonus window in the first instance while also starting a second
+/// one). acquire(forward=false) must therefore report the live primary as
+/// an error without sending anything.
+#[test]
+fn plain_acquire_does_not_forward_to_primary() {
+    let path = temp_socket_path("plain_acquire_does_not_forward_to_primary");
+    let (tx, rx) = mpsc::channel();
+
+    let instance = acquire(&path, false).expect("primary acquire");
+    let Instance::Primary { listen } = instance else {
+        panic!("first acquire must be primary");
+    };
+    std::thread::spawn(move || {
+        listen.spawn(move |msg| {
+            let _ = tx.send(msg);
+        });
+    });
+
+    // Give the accept loop a moment to start.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // Bind fails, the probe finds a live primary, no message is sent.
+    acquire(&path, false).expect_err("plain acquire must not forward");
+
+    // The primary must not have received anything from the probe.
+    assert!(
+        rx.recv_timeout(std::time::Duration::from_millis(300))
+            .is_err(),
+        "plain launch must not deliver a message to the primary"
+    );
 }

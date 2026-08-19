@@ -443,10 +443,12 @@ pub fn run(intent: crate::app::launch::LaunchIntent) -> Result<()> {
 
     // --- Single-instance coordination -------------------------------------
     // A second `meatshell --new-window` forwards to us and exits; we never
-    // run two GUI instances (Chrome-style). IPC failures fall through to a
-    // normal launch rather than blocking the app.
+    // run two GUI instances for that entry point (Chrome-style). Plain
+    // launches pass forward=false and never forward: if the endpoint is
+    // taken they run as an independent second instance. IPC failures fall
+    // through to a normal launch rather than blocking the app.
     let si_path = crate::app::single_instance::socket_path();
-    let instance = match crate::app::single_instance::acquire(&si_path) {
+    let instance = match crate::app::single_instance::acquire(&si_path, intent.new_window) {
         Ok(i) => Some(i),
         Err(e) => {
             tracing::warn!("single-instance acquire failed: {e}");
