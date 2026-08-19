@@ -1,4 +1,4 @@
-use crate::app::launch::{parse, LaunchIntent};
+use crate::app::launch::parse;
 
 #[test]
 fn no_flags_means_plain_launch() {
