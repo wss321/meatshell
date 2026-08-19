@@ -6,6 +6,7 @@
 //!   * Manage the tab list + per-tab `SessionHandle` map.
 //!   * Route Slint callbacks to the right domain module.
 mod auth_dialogs;
+pub mod launch;
 mod port_forward;
 mod quick_commands;
 mod resource_ui;
@@ -361,7 +362,7 @@ const NET_HISTORY_LEN: usize = 60;
 ///
 /// Windows gets its icon from the `.ico` embedded by winresource at link
 /// time; macOS from the app bundle — neither path needs runtime decoding.
-pub fn run() -> Result<()> {
+pub fn run(_intent: crate::app::launch::LaunchIntent) -> Result<()> {
     // Load the renderer preference before creating any Slint window. Reuse the
     // same store for the rest of the app so startup does not read the config
     // twice merely to select a backend (#280).
