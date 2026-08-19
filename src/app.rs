@@ -146,6 +146,7 @@ use i_slint_backend_winit::WinitWindowAccessor;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use tokio::runtime::Runtime;
 
+use crate::app::core::{AppCore, WindowRegistry};
 use crate::config::{
     is_reserved_session_group, AuthMethod, ConfigStore, OutputHighlightRule, Secret, Session,
     SessionKind,
@@ -364,7 +365,7 @@ const NET_HISTORY_LEN: usize = 60;
 ///
 /// Windows gets its icon from the `.ico` embedded by winresource at link
 /// time; macOS from the app bundle — neither path needs runtime decoding.
-pub fn run(_intent: crate::app::launch::LaunchIntent) -> Result<()> {
+pub fn run(intent: crate::app::launch::LaunchIntent) -> Result<()> {
     // Load the renderer preference before creating any Slint window. Reuse the
     // same store for the rest of the app so startup does not read the config
     // twice merely to select a backend (#280).
@@ -383,12 +384,70 @@ pub fn run(_intent: crate::app::launch::LaunchIntent) -> Result<()> {
     #[cfg(target_os = "macos")]
     setup_macos_platform(config.renderer_mode());
 
+    // --- Single-instance coordination -------------------------------------
+    // A second `meatshell --new-window` forwards to us and exits; we never
+    // run two GUI instances (Chrome-style). IPC failures fall through to a
+    // normal launch rather than blocking the app.
+    let si_path = crate::app::single_instance::socket_path();
+    let instance = match crate::app::single_instance::acquire(&si_path) {
+        Ok(i) => Some(i),
+        Err(e) => {
+            tracing::warn!("single-instance acquire failed: {e}");
+            None
+        }
+    };
+    if intent.new_window {
+        if let Some(crate::app::single_instance::Instance::Forwarded) = instance {
+            return Ok(());
+        }
+        // We are the primary (or IPC failed): fall through and open a window.
+    }
+
     // --- Runtime + store -------------------------------------------------
     let runtime = Arc::new(Runtime::new().context("failed to start tokio runtime")?);
     let store = Rc::new(RefCell::new(config));
     // Reachable from the Slint-thread event handler for recording terminal
     // commands into history (#113).
     HISTORY_STORE.with(|s| *s.borrow_mut() = Some(store.clone()));
+
+    let core = Rc::new(AppCore {
+        runtime,
+        store,
+        registry: Rc::new(WindowRegistry::default()),
+    });
+
+    // IPC listener: forwarded "new-window" requests are logged for now;
+    // Task 10 wires them to open_window.
+    if let Some(crate::app::single_instance::Instance::Primary { listen }) = instance {
+        std::thread::spawn(move || {
+            listen.spawn(move |msg| {
+                if msg == "new-window" {
+                    tracing::info!("single-instance: new-window request received");
+                }
+            });
+        });
+    }
+
+    // Set the Wayland app_id / X11 WM_CLASS *before* the window is created so
+    // the Linux desktop shell can match the running window to the installed
+    // `meatshell.desktop` entry and show our icon in the dock/taskbar.  (On
+    // Windows the icon comes from the embedded .ico, so this is a no-op there.)
+    let _ = slint::set_xdg_app_id("meatshell");
+    open_window(core.clone(), false)?;
+
+    // Global loop: window.run() returns when *its* window closes, which is
+    // wrong once several windows share the loop.
+    slint::run_event_loop().context("event loop exited with error")?;
+    Ok(())
+}
+
+/// Build and wire one application window. Called for the first window by
+/// `run()` and for every subsequent window by the new-window entry points.
+/// Returns the registry id used to unregister on close.
+fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
+    let runtime = core.runtime.clone();
+    let store = core.store.clone();
+    let registry = core.registry.clone();
 
     // Per-tab SSH handles (shell only; lives on Slint thread via Rc).
     let handles: Rc<RefCell<HashMap<String, SessionHandle>>> =
@@ -412,12 +471,11 @@ pub fn run(_intent: crate::app::launch::LaunchIntent) -> Result<()> {
     let last_term_size: Arc<Mutex<(u32, u32)>> = Arc::new(Mutex::new((80, 24)));
 
     // --- Build window + models ------------------------------------------
-    // Set the Wayland app_id / X11 WM_CLASS *before* the window is created so
-    // the Linux desktop shell can match the running window to the installed
-    // `meatshell.desktop` entry and show our icon in the dock/taskbar.  (On
-    // Windows the icon comes from the embedded .ico, so this is a no-op there.)
-    let _ = slint::set_xdg_app_id("meatshell");
     let window = AppWindow::new().context("failed to build Slint window")?;
+    // Cascade origin must be captured *before* registering: once registered,
+    // registry.newest() is this window itself.
+    let cascade_origin = if cascade { registry.newest() } else { None };
+    let window_id = registry.register(window.as_weak());
     // Slint applies preferred-width/height while the native window is being
     // created. Do not treat those startup Resized events as user adjustments;
     // otherwise they overwrite the persisted size before restoration (#278).
@@ -1894,7 +1952,7 @@ pub fn run(_intent: crate::app::launch::LaunchIntent) -> Result<()> {
     // exists, flip the banner on. Best-effort: any network/parse error is
     // silently ignored and the app keeps working on the current version.
     // Skipped entirely when the user turned the check off (#184).
-    if store.borrow().update_check_enabled() {
+    if registry.count() == 1 && store.borrow().update_check_enabled() {
         let weak = window.as_weak();
         std::thread::spawn(move || {
             let body =
@@ -2433,6 +2491,7 @@ pub fn run(_intent: crate::app::launch::LaunchIntent) -> Result<()> {
         let close_handles = handles.clone();
         let close_sftp_handles = sftp_handles.clone();
         let close_exit_confirmed = exit_confirmed.clone();
+        let close_registry = registry.clone();
         window.on_confirm_close_yes(move || {
             // Guard against a double click and against another close request
             // arriving from Windows Installer while shutdown is in progress.
@@ -2466,7 +2525,9 @@ pub fn run(_intent: crate::app::launch::LaunchIntent) -> Result<()> {
                 }
                 sftp.clear();
             }
-            let _ = slint::quit_event_loop();
+            if close_registry.unregister(window_id) {
+                let _ = slint::quit_event_loop();
+            }
         });
     }
 
@@ -2499,6 +2560,7 @@ pub fn run(_intent: crate::app::launch::LaunchIntent) -> Result<()> {
         let close_handles = handles.clone();
         let wc_store = store.clone();
         let wc_exit_confirmed = exit_confirmed.clone();
+        let wc_registry = registry.clone();
         window.on_win_close(move || {
             if let Some(w) = weak.upgrade() {
                 // Mirror the native-X behaviour: confirm if sessions are open.
@@ -2506,7 +2568,18 @@ pub fn run(_intent: crate::app::launch::LaunchIntent) -> Result<()> {
                 {
                     wc_exit_confirmed.set(true);
                     save_layout(&w, &wc_store);
-                    let _ = slint::quit_event_loop();
+                    // Tear down this window's workers; quit only if it was the last one.
+                    {
+                        let mut sessions = close_handles.borrow_mut();
+                        for handle in sessions.values() {
+                            handle.close();
+                        }
+                        sessions.clear();
+                    }
+                    let _ = w.hide();
+                    if wc_registry.unregister(window_id) {
+                        let _ = slint::quit_event_loop();
+                    }
                 } else {
                     w.set_confirm_close_open(true);
                 }
@@ -2547,19 +2620,31 @@ pub fn run(_intent: crate::app::launch::LaunchIntent) -> Result<()> {
         });
     }
 
-    // Center the window on the primary monitor once it's shown (size is only
-    // known after the first frame, so defer via a single-shot timer).
+    // Position once shown (size is only known after the first frame). The
+    // first window centers on the primary monitor; later windows cascade
+    // ~40 px from the newest existing window instead of stacking exactly on
+    // top of it. The origin was captured above, before this window was
+    // registered (registry.newest() would return this window itself).
     {
         let weak = window.as_weak();
+        let origin = cascade_origin
+            .and_then(|w| w.upgrade())
+            .map(|w| w.window().position());
         slint::Timer::single_shot(std::time::Duration::from_millis(30), move || {
-            if let Some(w) = weak.upgrade() {
-                center_window(&w);
+            let Some(w) = weak.upgrade() else { return };
+            match origin {
+                Some(pos) => {
+                    w.window().set_position(slint::PhysicalPosition::new(
+                        pos.x + 40,
+                        pos.y + 40,
+                    ));
+                }
+                None => center_window(&w),
             }
         });
     }
 
-    window.run().context("event loop exited with error")?;
-    Ok(())
+    Ok(window_id)
 }
 
 /// Center the window on the primary monitor's work area (Windows).

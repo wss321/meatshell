@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tokio::runtime::Runtime;
 
 use crate::config::ConfigStore;
+use crate::ui::AppWindow;
 
 /// Open-window registry, generic over the window handle so it can be unit
 /// tested without constructing Slint components. Production instantiates
@@ -79,6 +80,8 @@ pub struct AppCore {
     pub runtime: Arc<Runtime>,
     /// Shared among all windows; touched only on the Slint UI thread.
     pub store: Rc<RefCell<ConfigStore>>,
+    /// Live windows; the last one closing quits the shared event loop.
+    pub registry: Rc<WindowRegistry<slint::Weak<AppWindow>>>,
 }
 
 #[cfg(test)]
