@@ -3,7 +3,7 @@
 // only ever touched from that thread (the listener registry is written once
 // per window construction, also on the UI thread).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -20,7 +20,10 @@ use crate::ui::AppWindow;
 pub struct WindowRegistry<H> {
     next_id: RefCell<u64>,
     windows: RefCell<HashMap<u64, H>>,
-    listeners: RefCell<Vec<Rc<dyn Fn()>>>,
+    /// Config listeners keyed by window id, so `unregister` can drop the
+    /// closing window's closure (it captures that window's sessions model
+    /// and terminal buffers — leaving it behind would leak them until exit).
+    listeners: RefCell<HashMap<u64, Rc<dyn Fn()>>>,
 }
 
 impl<H: Clone> WindowRegistry<H> {
@@ -32,21 +35,25 @@ impl<H: Clone> WindowRegistry<H> {
         id
     }
 
-    /// Remove a window; returns true when the registry became empty (the
-    /// caller must then quit the event loop).
+    /// Remove a window (and its config listener); returns true when the
+    /// registry became empty (the caller must then quit the event loop).
     pub fn unregister(&self, id: u64) -> bool {
         self.windows.borrow_mut().remove(&id);
+        self.listeners.borrow_mut().remove(&id);
         self.windows.borrow().is_empty()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.windows.borrow().is_empty()
     }
 
+    #[cfg(test)]
     pub fn count(&self) -> usize {
         self.windows.borrow().len()
     }
 
+    #[cfg(test)]
     pub fn for_each<F: FnMut(&H)>(&self, mut f: F) {
         for h in self.windows.borrow().values() {
             f(h);
@@ -63,14 +70,14 @@ impl<H: Clone> WindowRegistry<H> {
             .map(|(_, h)| h.clone())
     }
 
-    pub fn add_config_listener(&self, f: Rc<dyn Fn()>) {
-        self.listeners.borrow_mut().push(f);
+    pub fn add_config_listener(&self, id: u64, f: Rc<dyn Fn()>) {
+        self.listeners.borrow_mut().insert(id, f);
     }
 
     /// Config (sessions / theme / language …) changed in one window; every
     /// window refreshes its derived UI state.
     pub fn broadcast_config_changed(&self) {
-        for l in self.listeners.borrow().iter() {
+        for l in self.listeners.borrow().values() {
             l();
         }
     }
@@ -82,6 +89,11 @@ pub struct AppCore {
     pub store: Rc<RefCell<ConfigStore>>,
     /// Live windows; the last one closing quits the shared event loop.
     pub registry: Rc<WindowRegistry<slint::Weak<AppWindow>>>,
+    /// Set once the first window of the process lifetime finishes opening.
+    /// The in-app update check runs only for that window — keying it off
+    /// `registry.count() == 1` would re-fire after close-then-open.
+    /// UI-thread-only, like the rest of this struct.
+    pub first_window_done: Cell<bool>,
 }
 
 #[cfg(test)]

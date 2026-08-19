@@ -473,6 +473,7 @@ pub fn run(intent: crate::app::launch::LaunchIntent) -> Result<()> {
         runtime,
         store,
         registry: Rc::new(WindowRegistry::default()),
+        first_window_done: Cell::new(false),
     });
 
     // IPC listener: forwarded "new-window" requests arrive on the listener
@@ -1508,7 +1509,7 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
         let store = store.clone();
         let sessions_model = sessions_model.clone();
         let bufs = bufs.clone();
-        registry.add_config_listener(Rc::new(move || {
+        registry.add_config_listener(window_id, Rc::new(move || {
             let Some(w) = weak.upgrade() else { return };
             // Rebuild the list with the window's current search filter.
             sync_sessions_for_window(&weak, &store.borrow(), &sessions_model);
@@ -2120,8 +2121,14 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
     // Query the GitHub releases API on a background thread; if a newer version
     // exists, flip the banner on. Best-effort: any network/parse error is
     // silently ignored and the app keeps working on the current version.
-    // Skipped entirely when the user turned the check off (#184).
-    if registry.count() == 1 && store.borrow().update_check_enabled() {
+    // Skipped entirely when the user turned the check off (#184). Runs only
+    // for the first window of the process: the old `registry.count() == 1`
+    // guard re-fired the check whenever the count returned to 1 after a
+    // close-then-open. The flag is set regardless of the enabled setting, so
+    // a disabled check is never deferred to a later window either.
+    let first_window = !core.first_window_done.get();
+    core.first_window_done.set(true);
+    if first_window && store.borrow().update_check_enabled() {
         let weak = window.as_weak();
         std::thread::spawn(move || {
             let body =

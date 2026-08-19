@@ -13,7 +13,8 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::UI::Shell::Common::{IObjectArray, IObjectCollection};
 use windows::Win32::UI::Shell::{
-    DestinationList, EnumerableObjectCollection, ICustomDestinationList, IShellLinkW, ShellLink,
+    DestinationList, EnumerableObjectCollection, ICustomDestinationList, IShellLinkW,
+    SetCurrentProcessExplicitAppUserModelID, ShellLink,
 };
 
 /// AppUserModelID used to attach the jump list to this application.
@@ -25,8 +26,22 @@ const APP_ID: &str = "meatshell";
 /// Failures are logged and swallowed — a missing jump list entry must never
 /// keep the app from starting.
 pub fn register_new_window_task() {
+    set_app_user_model_id();
     if let Err(e) = register_inner() {
         tracing::warn!("jump list registration failed: {e}");
+    }
+}
+
+/// Declare the process AppUserModelID so Explorer associates this process
+/// with the jump list published under `APP_ID` (taskbar grouping and the
+/// custom destination list). Without it the shell derives an ID from the
+/// exe path and may silently ignore our list.
+///
+/// The `w!` literal must equal `APP_ID` (the macro needs a string literal).
+/// Failure is warn-only, like everything else in this module.
+pub fn set_app_user_model_id() {
+    if let Err(e) = unsafe { SetCurrentProcessExplicitAppUserModelID(w!("meatshell")) } {
+        tracing::warn!("SetCurrentProcessExplicitAppUserModelID failed: {e}");
     }
 }
 

@@ -39,10 +39,26 @@ fn for_each_visits_live_entries() {
 #[test]
 fn config_listeners_fire_on_broadcast() {
     let reg: WindowRegistry<u32> = WindowRegistry::default();
+    let id = reg.register(1u32);
     let hits = Rc::new(Cell::new(0));
     let h1 = hits.clone();
-    reg.add_config_listener(Rc::new(move || h1.set(h1.get() + 1)));
+    reg.add_config_listener(id, Rc::new(move || h1.set(h1.get() + 1)));
     reg.broadcast_config_changed();
     reg.broadcast_config_changed();
     assert_eq!(hits.get(), 2);
+}
+
+#[test]
+fn config_listener_stops_firing_after_window_unregisters() {
+    let reg: WindowRegistry<u32> = WindowRegistry::default();
+    let id = reg.register(1u32);
+    let hits = Rc::new(Cell::new(0));
+    let h1 = hits.clone();
+    reg.add_config_listener(id, Rc::new(move || h1.set(h1.get() + 1)));
+    reg.broadcast_config_changed();
+    assert_eq!(hits.get(), 1);
+
+    reg.unregister(id);
+    reg.broadcast_config_changed();
+    assert_eq!(hits.get(), 1, "closed window's listener must be pruned");
 }
