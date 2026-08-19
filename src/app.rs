@@ -201,13 +201,18 @@ fn should_block_close(exit_confirmed: bool, has_live_sessions: bool) -> bool {
 }
 
 /// Tear down one window's workers (SSH + SFTP) and hide its detachable
-/// monitor windows. Idempotent: repeated calls see empty maps.
+/// monitor windows. Idempotent: repeated calls see empty maps. Also aborts
+/// every queued auth prompt (host key / credentials / MFA) owned by this
+/// window, answering reject/cancel so the blocked connection attempts fail
+/// cleanly instead of hanging on a dialog that will never show (#multi-window).
 fn teardown_window(
+    window_id: u64,
     handles: &Rc<RefCell<HashMap<String, SessionHandle>>>,
     sftp_handles: &SftpHandles,
     proc_weak: &slint::Weak<ProcWindow>,
     sys_weak: &slint::Weak<SystemInfoWindow>,
 ) {
+    abort_window_prompts(window_id);
     {
         let mut sessions = handles.borrow_mut();
         for handle in sessions.values() {
@@ -1866,6 +1871,7 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
     // --- Wire callbacks --------------------------------------------------
     wire_session_callbacks(
         &window,
+        window_id,
         store.clone(),
         registry.clone(),
         sessions_model.clone(),
@@ -1966,12 +1972,12 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
 
     // Host-key confirmation dialog (#109-5): the user trusts or rejects the
     // presented server key; the decision fans back out to the blocked SSH/SFTP
-    // handler(s) and the next queued prompt (if any) is shown.
+    // handler(s) and the next queued prompt for THIS window (if any) is shown.
     {
         let weak = window.as_weak();
         window.on_hostkey_accept(move || {
             if let Some(w) = weak.upgrade() {
-                resolve_front_hostkey(&w, true);
+                resolve_front_hostkey(&w, window_id, true);
             }
         });
     }
@@ -1979,7 +1985,7 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
         let weak = window.as_weak();
         window.on_hostkey_reject(move || {
             if let Some(w) = weak.upgrade() {
-                resolve_front_hostkey(&w, false);
+                resolve_front_hostkey(&w, window_id, false);
             }
         });
     }
@@ -1992,7 +1998,7 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
         window.on_cred_accept(move || {
             if let Some(w) = weak.upgrade() {
                 let remember = w.get_cred_remember();
-                resolve_front_cred(&w, true);
+                resolve_front_cred(&w, window_id, true);
                 // "Remember" persisted new credentials onto the saved session
                 // (auth_dialogs::persist_credentials); the registry is not
                 // reachable there, so broadcast from this owning callback.
@@ -2006,7 +2012,7 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
         let weak = window.as_weak();
         window.on_cred_reject(move || {
             if let Some(w) = weak.upgrade() {
-                resolve_front_cred(&w, false);
+                resolve_front_cred(&w, window_id, false);
             }
         });
     }
@@ -2017,7 +2023,7 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
         let weak = window.as_weak();
         window.on_mfa_submit(move || {
             if let Some(w) = weak.upgrade() {
-                resolve_front_mfa(&w, true);
+                resolve_front_mfa(&w, window_id, true);
             }
         });
     }
@@ -2025,7 +2031,7 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
         let weak = window.as_weak();
         window.on_mfa_cancel(move || {
             if let Some(w) = weak.upgrade() {
-                resolve_front_mfa(&w, false);
+                resolve_front_mfa(&w, window_id, false);
             }
         });
     }
@@ -2274,6 +2280,7 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
         store.clone(),
         ConnectCtx {
             weak: window.as_weak(),
+            window_id,
             runtime: runtime.clone(),
             handles: handles.clone(),
             sftp_handles: sftp_handles.clone(),
@@ -2675,6 +2682,7 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
                         // shared event loop if it was the last one — otherwise a
                         // stale registry entry blocks the quit of a later window.
                         teardown_window(
+                            window_id,
                             &close_handles,
                             &close_sftp_handles,
                             &ev_proc_weak,
@@ -2715,6 +2723,7 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
             // also makes any repeated close request see no live sessions and
             // pass through immediately.
             teardown_window(
+                window_id,
                 &close_handles,
                 &close_sftp_handles,
                 &proc_weak,
@@ -2769,6 +2778,7 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
                     // Tear down this window's workers and hide its monitor
                     // windows; quit only if it was the last one.
                     teardown_window(
+                        window_id,
                         &close_handles,
                         &close_sftp_handles,
                         &wc_proc_weak,
@@ -3273,6 +3283,9 @@ fn sync_sessions_for_window(
 /// `host|port|username|password|name` is skipped. Dedup happens at the call site.
 fn wire_session_callbacks(
     window: &AppWindow,
+    // Registry id of `window`; connect-time prompts are tagged with it so
+    // their dialogs open (and abort on close) in this window (#multi-window).
+    window_id: u64,
     store: Rc<RefCell<ConfigStore>>,
     registry: Rc<WindowRegistry<slint::Weak<AppWindow>>>,
     sessions_model: Rc<VecModel<SessionInfo>>,
@@ -4003,6 +4016,7 @@ fn wire_session_callbacks(
                                                 responder,
                                             } => enqueue_hostkey_prompt(
                                                 &w,
+                                                window_id,
                                                 host,
                                                 port,
                                                 key_type,
@@ -4019,6 +4033,7 @@ fn wire_session_callbacks(
                                                 responder,
                                             } => enqueue_cred_prompt(
                                                 &w,
+                                                window_id,
                                                 session_id,
                                                 host,
                                                 user,
@@ -4034,6 +4049,7 @@ fn wire_session_callbacks(
                                                 responder,
                                             } => enqueue_mfa_prompt(
                                                 &w,
+                                                window_id,
                                                 session_id,
                                                 host,
                                                 prompt,
@@ -4352,6 +4368,7 @@ fn wire_session_callbacks(
             // Shared with in-place reconnect (#79) via start_session_in_tab.
             let ctx = ConnectCtx {
                 weak: weak.clone(),
+                window_id,
                 runtime: runtime.clone(),
                 handles: handles.clone(),
                 sftp_handles: sftp_handles.clone(),

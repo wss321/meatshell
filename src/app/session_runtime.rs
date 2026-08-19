@@ -85,6 +85,7 @@ pub(super) fn start_session_in_tab(tab_id: &str, session: Session, ctx: &Connect
     // --- Shell event pump (dedicated thread) ---
     {
         let weak_inner = ctx.weak.clone();
+        let window_id_pump = ctx.window_id;
         let bufs_thread = ctx.bufs.clone();
         let sftp_handles_pump = ctx.sftp_handles.clone();
         let sftp_last_cwd_pump = ctx.sftp_last_cwd.clone();
@@ -277,7 +278,15 @@ pub(super) fn start_session_in_tab(tab_id: &str, session: Session, ctx: &Connect
                     if let Some(win) = weak_evt.upgrade() {
                         for evt in ui_only {
                             apply_session_event_to_window(
-                                &win, &tid, evt, &bufs_evt, &gates_evt, &st_evt, &lc_evt, &nh_evt,
+                                &win,
+                                window_id_pump,
+                                &tid,
+                                evt,
+                                &bufs_evt,
+                                &gates_evt,
+                                &st_evt,
+                                &lc_evt,
+                                &nh_evt,
                             );
                         }
                     }
@@ -289,6 +298,7 @@ pub(super) fn start_session_in_tab(tab_id: &str, session: Session, ctx: &Connect
     // --- SFTP event pump (separate thread, SSH only) ---
     if let Some(sftp_evt_tx) = sftp_evt_tx {
         let weak_sftp = ctx.weak.clone();
+        let window_id_sftp = ctx.window_id;
         let bufs_sftp = ctx.bufs.clone();
         let tab_id_sftp = tab_id.to_string();
         let statuses_sftp = ctx.tab_statuses.clone();
@@ -325,7 +335,15 @@ pub(super) fn start_session_in_tab(tab_id: &str, session: Session, ctx: &Connect
                     if let Some(win) = weak_s.upgrade() {
                         for sftp_evt in ui_batch {
                             apply_session_event_to_window(
-                                &win, &tid, sftp_evt, &bufs_s, &gates_s, &st_s, &lc_s, &nh_s,
+                                &win,
+                                window_id_sftp,
+                                &tid,
+                                sftp_evt,
+                                &bufs_s,
+                                &gates_s,
+                                &st_s,
+                                &lc_s,
+                                &nh_s,
                             );
                         }
                     }
