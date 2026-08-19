@@ -196,6 +196,35 @@ fn should_block_close(exit_confirmed: bool, has_live_sessions: bool) -> bool {
     !exit_confirmed && has_live_sessions
 }
 
+/// Tear down one window's workers (SSH + SFTP) and hide its detachable
+/// monitor windows. Idempotent: repeated calls see empty maps.
+fn teardown_window(
+    handles: &Rc<RefCell<HashMap<String, SessionHandle>>>,
+    sftp_handles: &SftpHandles,
+    proc_weak: &slint::Weak<ProcWindow>,
+    sys_weak: &slint::Weak<SystemInfoWindow>,
+) {
+    {
+        let mut sessions = handles.borrow_mut();
+        for handle in sessions.values() {
+            handle.close();
+        }
+        sessions.clear();
+    }
+    if let Ok(mut sftp) = sftp_handles.lock() {
+        for handle in sftp.values() {
+            handle.close();
+        }
+        sftp.clear();
+    }
+    if let Some(w) = proc_weak.upgrade() {
+        let _ = w.hide();
+    }
+    if let Some(w) = sys_weak.upgrade() {
+        let _ = w.hide();
+    }
+}
+
 /// Tab ids currently shown in a pane (`term.id == pane.active-id` in Slint).
 fn visible_tab_ids(win: &AppWindow) -> HashSet<String> {
     use slint::Model as _;
@@ -473,9 +502,10 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
     // --- Build window + models ------------------------------------------
     let window = AppWindow::new().context("failed to build Slint window")?;
     // Cascade origin must be captured *before* registering: once registered,
-    // registry.newest() is this window itself.
+    // registry.newest() is this window itself. Registration itself is deferred
+    // until after the last fallible construction below, so a failed monitor
+    // window never leaves a stale registry entry.
     let cascade_origin = if cascade { registry.newest() } else { None };
-    let window_id = registry.register(window.as_weak());
     // Slint applies preferred-width/height while the native window is being
     // created. Do not treat those startup Resized events as user adjustments;
     // otherwise they overwrite the persisted size before restoration (#278).
@@ -530,6 +560,9 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
     proc_win.set_custom_titlebar(cfg!(not(target_os = "macos")));
     proc_win.set_proc_list(ModelRc::from(proc_rows_model.clone()));
     let sys_win = SystemInfoWindow::new().context("failed to build system info window")?;
+    // Every fallible construction has now succeeded — register the window.
+    // (cascade_origin above was captured before this point, as required.)
+    let window_id = registry.register(window.as_weak());
     sys_win.set_custom_titlebar(cfg!(not(target_os = "macos")));
     sys_win.set_metrics(ModelRc::from(sys_metrics_model.clone()));
     sys_win.set_nets(ModelRc::from(sys_net_rows_model.clone()));
@@ -2182,6 +2215,8 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
         let wheel_bufs = bufs.clone();
         let close_handles = handles.clone();
         let close_sftp_handles = sftp_handles.clone();
+        let ev_proc_weak = proc_win.as_weak();
+        let ev_sys_weak = sys_win.as_weak();
         let ev_store = store.clone();
         let ev_activity = activity.clone();
         let ev_exit_confirmed = exit_confirmed.clone();
@@ -2483,19 +2518,12 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
                         // this window's workers and unregister it, quitting the
                         // shared event loop if it was the last one — otherwise a
                         // stale registry entry blocks the quit of a later window.
-                        {
-                            let mut sessions = close_handles.borrow_mut();
-                            for handle in sessions.values() {
-                                handle.close();
-                            }
-                            sessions.clear();
-                        }
-                        if let Ok(mut sftp) = close_sftp_handles.lock() {
-                            for handle in sftp.values() {
-                                handle.close();
-                            }
-                            sftp.clear();
-                        }
+                        teardown_window(
+                            &close_handles,
+                            &close_sftp_handles,
+                            &ev_proc_weak,
+                            &ev_sys_weak,
+                        );
                         if ev_registry.unregister(window_id) {
                             let _ = slint::quit_event_loop();
                         }
@@ -2526,28 +2554,16 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
                 save_layout(&w, &cc_store);
                 let _ = w.hide();
             }
-            if let Some(w) = proc_weak.upgrade() {
-                let _ = w.hide();
-            }
-            if let Some(w) = sys_weak.upgrade() {
-                let _ = w.hide();
-            }
             // Ask every worker to stop before the runtime/event loop is torn
-            // down. Clearing the maps also makes any repeated close request see
-            // no live sessions and pass through immediately.
-            {
-                let mut sessions = close_handles.borrow_mut();
-                for handle in sessions.values() {
-                    handle.close();
-                }
-                sessions.clear();
-            }
-            if let Ok(mut sftp) = close_sftp_handles.lock() {
-                for handle in sftp.values() {
-                    handle.close();
-                }
-                sftp.clear();
-            }
+            // down, and hide the detachable monitor windows. Clearing the maps
+            // also makes any repeated close request see no live sessions and
+            // pass through immediately.
+            teardown_window(
+                &close_handles,
+                &close_sftp_handles,
+                &proc_weak,
+                &sys_weak,
+            );
             if close_registry.unregister(window_id) {
                 let _ = slint::quit_event_loop();
             }
@@ -2582,6 +2598,8 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
         let weak = window.as_weak();
         let close_handles = handles.clone();
         let close_sftp_handles = sftp_handles.clone();
+        let wc_proc_weak = proc_win.as_weak();
+        let wc_sys_weak = sys_win.as_weak();
         let wc_store = store.clone();
         let wc_exit_confirmed = exit_confirmed.clone();
         let wc_registry = registry.clone();
@@ -2592,20 +2610,14 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
                 {
                     wc_exit_confirmed.set(true);
                     save_layout(&w, &wc_store);
-                    // Tear down this window's workers; quit only if it was the last one.
-                    {
-                        let mut sessions = close_handles.borrow_mut();
-                        for handle in sessions.values() {
-                            handle.close();
-                        }
-                        sessions.clear();
-                    }
-                    if let Ok(mut sftp) = close_sftp_handles.lock() {
-                        for handle in sftp.values() {
-                            handle.close();
-                        }
-                        sftp.clear();
-                    }
+                    // Tear down this window's workers and hide its monitor
+                    // windows; quit only if it was the last one.
+                    teardown_window(
+                        &close_handles,
+                        &close_sftp_handles,
+                        &wc_proc_weak,
+                        &wc_sys_weak,
+                    );
                     let _ = w.hide();
                     if wc_registry.unregister(window_id) {
                         let _ = slint::quit_event_loop();
