@@ -7,6 +7,8 @@
 //!   * Route Slint callbacks to the right domain module.
 mod auth_dialogs;
 mod core;
+#[cfg(target_os = "macos")]
+mod dock_menu;
 #[cfg(windows)]
 mod jump_list;
 pub mod launch;
@@ -380,6 +382,30 @@ fn do_tab_render_flush(
 /// Number of samples kept for the sparkline.
 const NET_HISTORY_LEN: usize = 60;
 
+/// Set once by `run()`; lets a platform entry point outside the Slint
+/// callback tree (the macOS Dock menu) open a window. Only ever invoked from
+/// the UI/main thread.
+#[cfg(target_os = "macos")]
+thread_local! {
+    static NEW_WINDOW_HOOK: RefCell<Option<Rc<dyn Fn()>>> = RefCell::new(None);
+}
+
+#[cfg(target_os = "macos")]
+fn set_new_window_hook(f: Rc<dyn Fn()>) {
+    NEW_WINDOW_HOOK.with(|h| *h.borrow_mut() = Some(f));
+}
+
+/// Open a new window from a platform entry point (macOS Dock menu action).
+/// Runs on the main/UI thread; a no-op until `run()` installs the hook.
+#[cfg(target_os = "macos")]
+pub(crate) fn request_new_window() {
+    NEW_WINDOW_HOOK.with(|h| {
+        if let Some(f) = h.borrow().as_ref() {
+            f();
+        }
+    });
+}
+
 /// Embed the app icon PNG into the binary and set it as the X11 window icon.
 ///
 /// On X11, the taskbar/dock icon for a running window comes from the
@@ -470,6 +496,20 @@ pub fn run(intent: crate::app::launch::LaunchIntent) -> Result<()> {
     // warn-only and never blocks startup.
     #[cfg(windows)]
     crate::app::jump_list::register_new_window_task();
+
+    // macOS Dock menu ("新建窗口"): install the new-window hook first so a
+    // Dock click can never race ahead of it, then patch NSApplication.
+    // Failures are warn-only and never block startup (see dock_menu.rs).
+    #[cfg(target_os = "macos")]
+    {
+        let core = core.clone();
+        set_new_window_hook(Rc::new(move || {
+            if let Err(e) = open_window(core.clone(), true) {
+                tracing::warn!("failed to open new window: {e:#}");
+            }
+        }));
+        crate::app::dock_menu::install_dock_menu();
+    }
 
     open_window(core.clone(), false)?;
 
