@@ -473,13 +473,20 @@ pub fn run(intent: crate::app::launch::LaunchIntent) -> Result<()> {
         registry: Rc::new(WindowRegistry::default()),
     });
 
-    // IPC listener: forwarded "new-window" requests are logged for now;
-    // Task 10 wires them to open_window.
+    // IPC listener: forwarded "new-window" requests arrive on the listener
+    // thread, but open_window() must run on the Slint UI thread — and
+    // AppCore holds Rc state, so it cannot cross threads via
+    // invoke_from_event_loop either. Bridge the gap with an mpsc channel:
+    // this thread sends one () per request, and a repeating UI-thread timer
+    // (created after the first window below) drains the receiver and opens
+    // the windows.
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
     if let Some(crate::app::single_instance::Instance::Primary { listen }) = instance {
         std::thread::spawn(move || {
             listen.spawn(move |msg| {
                 if msg == "new-window" {
                     tracing::info!("single-instance: new-window request received");
+                    let _ = tx.send(());
                 }
             });
         });
@@ -513,9 +520,35 @@ pub fn run(intent: crate::app::launch::LaunchIntent) -> Result<()> {
 
     open_window(core.clone(), false)?;
 
+    // UI-thread drain for forwarded new-window requests: the IPC listener
+    // above sends one () per request; this repeating timer picks them up on
+    // the Slint thread where open_window() may run. Each message is an
+    // explicit user action ("新建窗口"), so every pending message opens its
+    // own cascaded window rather than coalescing the batch. `ipc_timer` is
+    // a plain local binding: Slint timers stop when dropped, and run()
+    // blocks on run_event_loop below, so this keeps it alive for exactly the
+    // event loop's lifetime — no leaking needed.
+    let ipc_timer = {
+        let core = core.clone();
+        let timer = slint::Timer::default();
+        timer.start(
+            slint::TimerMode::Repeated,
+            std::time::Duration::from_millis(250),
+            move || {
+                while rx.try_recv().is_ok() {
+                    if let Err(e) = open_window(core.clone(), true) {
+                        tracing::warn!("failed to open forwarded window: {e:#}");
+                    }
+                }
+            },
+        );
+        timer
+    };
+
     // Global loop: window.run() returns when *its* window closes, which is
     // wrong once several windows share the loop.
     slint::run_event_loop().context("event loop exited with error")?;
+    drop(ipc_timer);
     Ok(())
 }
 
