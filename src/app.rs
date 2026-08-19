@@ -1354,6 +1354,7 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
         let store = store.clone();
         let bufs_wp = bufs.clone();
         let proc_weak = proc_win.as_weak();
+        let registry = registry.clone();
         window.on_set_wallpaper(move |id: SharedString| {
             let id = id.to_string();
             let mut selected_builtin_theme = None;
@@ -1367,15 +1368,22 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
                     sync_proc_theme(&w, &p);
                 }
             }
-            let mut s = store.borrow_mut();
-            s.set_wallpaper(id);
-            // Choosing a built-in wallpaper applies its recommended palette once;
-            // persist that result so it too survives the next launch. A later
-            // manual theme toggle will overwrite this preference as expected.
-            if let Some(dark) = selected_builtin_theme {
-                s.set_theme_pref(if dark { "dark" } else { "light" }.to_string());
+            {
+                let mut s = store.borrow_mut();
+                s.set_wallpaper(id);
+                // Choosing a built-in wallpaper applies its recommended palette once;
+                // persist that result so it too survives the next launch. A later
+                // manual theme toggle will overwrite this preference as expected.
+                if let Some(dark) = selected_builtin_theme {
+                    s.set_theme_pref(if dark { "dark" } else { "light" }.to_string());
+                }
+                let _ = s.save();
             }
-            let _ = s.save();
+            // Only the theme flip needs cross-window propagation; the wallpaper
+            // image itself is not synced to other windows (YAGNI).
+            if selected_builtin_theme.is_some() {
+                registry.broadcast_config_changed();
+            }
         });
     }
     {
@@ -1407,6 +1415,25 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
     window.set_sessions(ModelRc::from(sessions_model.clone()));
     sync_sessions_to_model(&store.borrow(), &sessions_model);
     window.set_wsl_profiles(wsl_profile_model(&store.borrow()));
+    // Cross-window propagation: when another window persists sessions / theme /
+    // language it broadcasts; re-sync what this window shows. The listener only
+    // READS the store and updates this window's models (never saves), so a
+    // broadcast can never re-enter the broadcast path.
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        let sessions_model = sessions_model.clone();
+        let bufs = bufs.clone();
+        registry.add_config_listener(Rc::new(move || {
+            let Some(w) = weak.upgrade() else { return };
+            // Rebuild the list with the window's current search filter.
+            sync_sessions_for_window(&weak, &store.borrow(), &sessions_model);
+            // Re-apply the theme to the chrome AND every open terminal buffer.
+            apply_dark_mode(&w, &bufs, theme_pref_is_dark(&store.borrow()));
+            // Language translations are process-global; refresh our flag only.
+            w.set_lang_en(crate::i18n::is_en());
+        }));
+    }
     {
         let weak = window.as_weak();
         window.on_pick_wsl_directory(move || {
@@ -1421,38 +1448,47 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
         let weak = window.as_weak();
         let store = store.clone();
         let sessions_model = sessions_model.clone();
+        let registry = registry.clone();
         window.on_add_wsl_profile(move |name, distribution, directory| {
-            let mut s = store.borrow_mut();
-            s.add_wsl_profile(
-                name.to_string(),
-                distribution.to_string(),
-                directory.to_string(),
-            );
-            let _ = s.save();
-            if let Some(w) = weak.upgrade() {
-                w.set_wsl_profiles(wsl_profile_model(&s));
-                sync_sessions_for_window(&weak, &s, &sessions_model);
+            {
+                let mut s = store.borrow_mut();
+                s.add_wsl_profile(
+                    name.to_string(),
+                    distribution.to_string(),
+                    directory.to_string(),
+                );
+                let _ = s.save();
+                if let Some(w) = weak.upgrade() {
+                    w.set_wsl_profiles(wsl_profile_model(&s));
+                    sync_sessions_for_window(&weak, &s, &sessions_model);
+                }
             }
+            registry.broadcast_config_changed();
         });
     }
     {
         let weak = window.as_weak();
         let store = store.clone();
         let sessions_model = sessions_model.clone();
+        let registry = registry.clone();
         window.on_remove_wsl_profile(move |id| {
-            let mut s = store.borrow_mut();
-            s.remove_wsl_profile(id.as_str());
-            let _ = s.save();
-            if let Some(w) = weak.upgrade() {
-                w.set_wsl_profiles(wsl_profile_model(&s));
-                sync_sessions_for_window(&weak, &s, &sessions_model);
+            {
+                let mut s = store.borrow_mut();
+                s.remove_wsl_profile(id.as_str());
+                let _ = s.save();
+                if let Some(w) = weak.upgrade() {
+                    w.set_wsl_profiles(wsl_profile_model(&s));
+                    sync_sessions_for_window(&weak, &s, &sessions_model);
+                }
             }
+            registry.broadcast_config_changed();
         });
     }
     {
         let weak = window.as_weak();
         let store = store.clone();
         let sessions_model = sessions_model.clone();
+        let registry = registry.clone();
         window.on_webdav_download(move || {
             let Some(w) = weak.upgrade() else { return };
             let enabled = w.get_webdav_enabled();
@@ -1488,6 +1524,7 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
             let msg = match res {
                 Ok((added, skipped)) => {
                     sync_sessions_for_window(&weak, &store.borrow(), &sessions_model);
+                    registry.broadcast_config_changed();
                     format!(
                         "{} {}, {} {}",
                         t("已导入", "imported"),
@@ -1745,6 +1782,7 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
     wire_session_callbacks(
         &window,
         store.clone(),
+        registry.clone(),
         sessions_model.clone(),
         tabs_model.clone(),
         terminals_model.clone(),
@@ -1786,6 +1824,7 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
         let weak = window.as_weak();
         let store = store.clone();
         let tabs_model = tabs_model.clone();
+        let registry = registry.clone();
         window.on_set_language(move |code| {
             crate::i18n::set_language(&code.to_string());
             {
@@ -1793,6 +1832,7 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
                 s.set_language(crate::i18n::current_code().to_string());
                 let _ = s.save();
             }
+            registry.broadcast_config_changed();
             // Re-translate the welcome tab's dynamic title.
             for i in 0..tabs_model.row_count() {
                 if let Some(mut row) = tabs_model.row_data(i) {
@@ -1818,6 +1858,7 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
         let store = store.clone();
         let bufs_theme = bufs.clone();
         let proc_weak = proc_win.as_weak();
+        let registry = registry.clone();
         window.on_toggle_theme(move || {
             let Some(w) = weak.upgrade() else { return };
             let next_dark = !w.get_dark_mode();
@@ -1829,9 +1870,12 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
                 sync_proc_theme(&w, &p);
             }
             let pref = if next_dark { "dark" } else { "light" };
-            let mut s = store.borrow_mut();
-            s.set_theme_pref(pref.to_string());
-            let _ = s.save();
+            {
+                let mut s = store.borrow_mut();
+                s.set_theme_pref(pref.to_string());
+                let _ = s.save();
+            }
+            registry.broadcast_config_changed();
         });
     }
 
@@ -1859,9 +1903,17 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
     // username/password (or cancels); the answer unblocks the SSH/SFTP auth.
     {
         let weak = window.as_weak();
+        let registry = registry.clone();
         window.on_cred_accept(move || {
             if let Some(w) = weak.upgrade() {
+                let remember = w.get_cred_remember();
                 resolve_front_cred(&w, true);
+                // "Remember" persisted new credentials onto the saved session
+                // (auth_dialogs::persist_credentials); the registry is not
+                // reachable there, so broadcast from this owning callback.
+                if remember {
+                    registry.broadcast_config_changed();
+                }
             }
         });
     }
@@ -3131,6 +3183,7 @@ fn sync_sessions_for_window(
 fn wire_session_callbacks(
     window: &AppWindow,
     store: Rc<RefCell<ConfigStore>>,
+    registry: Rc<WindowRegistry<slint::Weak<AppWindow>>>,
     sessions_model: Rc<VecModel<SessionInfo>>,
     tabs_model: Rc<VecModel<TabInfo>>,
     terminals_model: Rc<VecModel<TerminalState>>,
@@ -3229,6 +3282,7 @@ fn wire_session_callbacks(
         let weak = window.as_weak();
         let store = store.clone();
         let sessions_model = sessions_model.clone();
+        let registry = registry.clone();
         window.on_import_ssh_config(move || {
             let hosts = crate::ssh::ssh_config::parse_default();
             let mut added = 0usize;
@@ -3277,6 +3331,9 @@ fn wire_session_callbacks(
                 }
             }
             sync_sessions_for_window(&weak, &store.borrow(), &sessions_model);
+            if added > 0 {
+                registry.broadcast_config_changed();
+            }
             if let Some(w) = weak.upgrade() {
                 let hint = if added > 0 {
                     format!("{} {}", t("已导入", "imported"), added)
@@ -3317,6 +3374,7 @@ fn wire_session_callbacks(
         let weak = window.as_weak();
         let store = store.clone();
         let sessions_model = sessions_model.clone();
+        let registry = registry.clone();
         window.on_batch_import_confirm(move |text: SharedString| {
             let parsed = parse_batch_import(text.as_str());
             let total = parsed.len();
@@ -3340,6 +3398,9 @@ fn wire_session_callbacks(
                 }
             }
             sync_sessions_for_window(&weak, &store.borrow(), &sessions_model);
+            if added > 0 {
+                registry.broadcast_config_changed();
+            }
             if let Some(w) = weak.upgrade() {
                 let hint = if total == 0 {
                     t("没有可导入的连接", "nothing to import").to_string()
@@ -3358,6 +3419,7 @@ fn wire_session_callbacks(
         let weak = window.as_weak();
         let store = store.clone();
         let sessions_model = sessions_model.clone();
+        let registry = registry.clone();
         window.on_import_sessions(move || {
             if let Some(path) = rfd::FileDialog::new()
                 .add_filter("JSON", &["json"])
@@ -3368,6 +3430,7 @@ fn wire_session_callbacks(
                     let hint = match res {
                         Ok((added, skipped)) => {
                             sync_sessions_for_window(&weak, &store.borrow(), &sessions_model);
+                            registry.broadcast_config_changed();
                             format!(
                                 "{} {} / {} {}",
                                 t("已导入", "imported"),
@@ -3445,6 +3508,7 @@ fn wire_session_callbacks(
         let weak = window.as_weak();
         let store = store.clone();
         let sessions_model = sessions_model.clone();
+        let registry = registry.clone();
         window.on_remove_session(move |id: SharedString| {
             {
                 let mut s = store.borrow_mut();
@@ -3454,6 +3518,7 @@ fn wire_session_callbacks(
                 }
             }
             sync_sessions_for_window(&weak, &store.borrow(), &sessions_model);
+            registry.broadcast_config_changed();
             if let Some(w) = weak.upgrade() {
                 // Touch a property so the list re-renders reliably.
                 let _ = w.get_sessions();
@@ -3466,7 +3531,9 @@ fn wire_session_callbacks(
         let weak = window.as_weak();
         let store = store.clone();
         let sessions_model = sessions_model.clone();
+        let registry = registry.clone();
         window.on_duplicate_session(move |id: SharedString| {
+            let mut duplicated = false;
             {
                 let mut s = store.borrow_mut();
                 if let Some(orig) = s.get(&id.to_string()).cloned() {
@@ -3478,9 +3545,13 @@ fn wire_session_callbacks(
                     if let Err(err) = s.save() {
                         tracing::warn!("failed to save config: {err:#}");
                     }
+                    duplicated = true;
                 }
             }
             sync_sessions_for_window(&weak, &store.borrow(), &sessions_model);
+            if duplicated {
+                registry.broadcast_config_changed();
+            }
             if let Some(w) = weak.upgrade() {
                 let _ = w.get_sessions();
             }
@@ -3492,13 +3563,15 @@ fn wire_session_callbacks(
         let weak = window.as_weak();
         let store = store.clone();
         let sessions_model = sessions_model.clone();
+        let registry = registry.clone();
         window.on_move_session(move |id: SharedString, group: SharedString| {
+            let mut moved = false;
             {
                 let mut s = store.borrow_mut();
                 if let Some(orig) = s.get(&id.to_string()).cloned() {
-                    let mut moved = orig;
+                    let mut target = orig;
                     // "default" is the display label for ungrouped → store empty.
-                    moved.group = if group.as_str().eq_ignore_ascii_case("default") {
+                    target.group = if group.as_str().eq_ignore_ascii_case("default") {
                         String::new()
                     } else if is_reserved_session_group(group.as_str().trim()) {
                         // `system` belongs exclusively to built-in local shells.
@@ -3506,13 +3579,17 @@ fn wire_session_callbacks(
                     } else {
                         group.to_string()
                     };
-                    s.upsert(moved);
+                    s.upsert(target);
                     if let Err(err) = s.save() {
                         tracing::warn!("failed to save config: {err:#}");
                     }
+                    moved = true;
                 }
             }
             sync_sessions_for_window(&weak, &store.borrow(), &sessions_model);
+            if moved {
+                registry.broadcast_config_changed();
+            }
             if let Some(w) = weak.upgrade() {
                 let _ = w.get_sessions();
             }
@@ -3573,6 +3650,7 @@ fn wire_session_callbacks(
         let weak = window.as_weak();
         let store = store.clone();
         let sessions_model = sessions_model.clone();
+        let registry = registry.clone();
         window.on_submit_group(move |orig: SharedString, name: SharedString| {
             let trimmed = name.trim();
             let error = {
@@ -3604,6 +3682,7 @@ fn wire_session_callbacks(
                 }
             }
             sync_sessions_for_window(&weak, &store.borrow(), &sessions_model);
+            registry.broadcast_config_changed();
             if let Some(w) = weak.upgrade() {
                 let _ = w.get_sessions();
             }
@@ -3615,6 +3694,7 @@ fn wire_session_callbacks(
         let weak = window.as_weak();
         let store = store.clone();
         let sessions_model = sessions_model.clone();
+        let registry = registry.clone();
         window.on_delete_group(move |name: SharedString| {
             {
                 let mut s = store.borrow_mut();
@@ -3624,6 +3704,7 @@ fn wire_session_callbacks(
                 }
             }
             sync_sessions_for_window(&weak, &store.borrow(), &sessions_model);
+            registry.broadcast_config_changed();
             if let Some(w) = weak.upgrade() {
                 let _ = w.get_sessions();
             }
@@ -3636,6 +3717,7 @@ fn wire_session_callbacks(
         let store = store.clone();
         let sessions_model = sessions_model.clone();
         let edit_forwards = edit_forwards.clone();
+        let registry = registry.clone();
         window.on_session_dialog_submit(move |draft: SessionDraft| {
             let id = draft.id.to_string();
             let forwards = match validated_port_forwards(&edit_forwards.borrow()) {
@@ -3742,6 +3824,7 @@ fn wire_session_callbacks(
                 }
             }
             sync_sessions_for_window(&weak, &store.borrow(), &sessions_model);
+            registry.broadcast_config_changed();
             if let Some(w) = weak.upgrade() {
                 w.set_dialog_open(false);
             }
