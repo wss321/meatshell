@@ -2852,6 +2852,11 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
         });
     }
 
+    // The old entry point was window.run(), which shows the window before
+    // spinning the loop. run_event_loop() does not, so display it here —
+    // without this the app starts but no window ever appears (#multi-window).
+    window.show().context("failed to show window")?;
+
     Ok(window_id)
 }
 
