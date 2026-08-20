@@ -69,7 +69,8 @@ fn main() -> anyhow::Result<()> {
     // are handled instead by the C0-marker + 3-layer Backspace filters in
     // `app::on_send_key`, so we no longer need (and must not use) ImmDisableIME.
 
-    app::run()
+    let intent = app::launch::parse(&args);
+    app::run(intent)
 }
 
 /// Set up tracing: stderr (honours RUST_LOG, default info) **plus** a capped
