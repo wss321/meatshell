@@ -3838,6 +3838,44 @@ fn wire_session_callbacks(
         });
     }
 
+    // Drag-to-reorder a host card among its same-group siblings. The stored
+    // Vec order is the display order (no alphabetical sort), so a swap plus
+    // re-sync is all it takes. Reordering while the list is filtered would map
+    // visible hops onto the wrong stored neighbours, so bail out then — the
+    // Slint side already disables the gesture while searching.
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        let sessions_model = sessions_model.clone();
+        let registry = registry.clone();
+        window.on_reorder_session(move |id: SharedString, dir: i32| {
+            if weak
+                .upgrade()
+                .map(|window| !window.get_host_search_query().trim().is_empty())
+                .unwrap_or(false)
+            {
+                return;
+            }
+            let mut moved = false;
+            {
+                let mut s = store.borrow_mut();
+                moved = s.reorder_session(id.as_str(), dir as isize);
+                if moved {
+                    if let Err(err) = s.save() {
+                        tracing::warn!("failed to save config: {err:#}");
+                    }
+                }
+            }
+            sync_sessions_for_window(&weak, &store.borrow(), &sessions_model);
+            if moved {
+                registry.broadcast_config_changed();
+            }
+            if let Some(w) = weak.upgrade() {
+                let _ = w.get_sessions();
+            }
+        });
+    }
+
     // Collapse / expand a group in the welcome list (#41). Toggling flips the
     // `collapsed` flag on every row of that group in place — no full re-sync —
     // so the open/closed state stays put until the list is actually rebuilt.

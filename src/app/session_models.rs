@@ -244,7 +244,7 @@ fn build_session_rows(
         });
     }
     for group in &display_groups {
-        let mut gs: Vec<&Session> = if group == "default" {
+        let gs: Vec<&Session> = if group == "default" {
             sessions
                 .iter()
                 .filter(|session| {
@@ -258,8 +258,9 @@ fn build_session_rows(
                 .filter(|session| &session.group == group && matches(session))
                 .collect()
         };
-        gs.sort_by_key(|s| s.name.to_lowercase());
-
+        // No alphabetical sort: the stored Vec order is the user's manual
+        // order, maintained by drag-to-reorder (same convention as quick
+        // commands). New sessions land at the end of their group.
         if gs.is_empty() && !searching {
             rows.push(blank(group));
         } else {
@@ -310,9 +311,7 @@ pub(super) fn sync_sessions_to_model(store: &ConfigStore, model: &VecModel<Sessi
     sync_sessions_to_model_with_filter(store, model, "");
 }
 
-pub(super) fn builtin_local_sessions(
-    wsl_profiles: &[crate::config::WslProfile],
-) -> Vec<Session> {
+pub(super) fn builtin_local_sessions(wsl_profiles: &[crate::config::WslProfile]) -> Vec<Session> {
     let mut out = Vec::new();
     #[cfg(windows)]
     {

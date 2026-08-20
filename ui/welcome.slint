@@ -25,10 +25,19 @@ component SessionRow inherits Rectangle {
     callback duplicate();
     callback move-to-group(string);
     callback remove();
+    // Drag-to-reorder: direction -1 = up, 1 = down. Emitted once per row-hop.
+    callback reorder(int);
     // Full session list — group-header is non-empty once per group, so the
     // "move to group" submenu can iterate it to list each group exactly once.
     in property <[SessionInfo]> all-sessions;
+    // Drag is only allowed outside search (visible indices would not match
+    // stored order) and never on built-in system rows.
+    in property <bool> reorder-enabled: false;
     property <bool> system-row: root.session.builtin;
+    // Vertical drag state (mirrors the tab-bar hop pattern in tabs.slint).
+    property <bool> pressing: false;
+    property <bool> dragging: false;
+    property <length> grab-y;
 
     height: root.compact ? 44px : 36px;
     border-radius: Theme.radius-sm;
@@ -40,8 +49,9 @@ component SessionRow inherits Rectangle {
     property <length> ctx-y;
 
     touch := TouchArea {
-        mouse-cursor: pointer;
-        clicked => { root.connect(); }
+        mouse-cursor: root.dragging ? move : pointer;
+        // Connect is handled in pointer-event below so a finished drag never
+        // counts as a click.
         pointer-event(e) => {
             // Built-in PowerShell/CMD/WSL rows have no edit/move/delete actions.
             // All menu items are conditional on !system-row, so opening the
@@ -50,6 +60,44 @@ component SessionRow inherits Rectangle {
                 ctx-x = self.mouse-x;
                 ctx-y = self.mouse-y;
                 ctx-menu.show();
+            } else if (e.button == PointerEventButton.left) {
+                if (e.kind == PointerEventKind.down) {
+                    root.pressing = true;
+                    // Reset any stale drag (e.g. released outside the row).
+                    root.dragging = false;
+                    root.grab-y = self.mouse-y;
+                } else if (e.kind == PointerEventKind.up) {
+                    // `pressing` proves this row instance received the down:
+                    // a hop rebuilds the model and replaces the drag source
+                    // before pointer-up arrives, so the fresh row underneath
+                    // the cursor must not treat the release as a click.
+                    if (root.pressing && !root.dragging) {
+                        root.connect();
+                    }
+                    root.pressing = false;
+                    root.dragging = false;
+                }
+            }
+        }
+        moved => {
+            if (!root.pressing) { return; }
+            if (!root.dragging) {
+                // A few pixels of vertical drift start a reorder drag; below
+                // that the press still resolves to a connect click.
+                if (root.reorder-enabled && abs(touch.mouse-y - root.grab-y) > 5px) {
+                    root.dragging = true;
+                    root.grab-y = touch.mouse-y;
+                }
+            } else {
+                // One hop per full row crossed, then re-anchor — the same
+                // anti-oscillation scheme the tab bar uses.
+                if (touch.mouse-y - root.grab-y > root.height / 2 + 2px) {
+                    root.grab-y = touch.mouse-y;
+                    root.reorder(1);
+                } else if (root.grab-y - touch.mouse-y > root.height / 2 + 2px) {
+                    root.grab-y = touch.mouse-y;
+                    root.reorder(-1);
+                }
             }
         }
     }
@@ -259,6 +307,8 @@ export component Welcome inherits Rectangle {
     callback edit-session(string);
     callback duplicate-session(string);
     callback move-session(string /* id */, string /* group */);
+    // Drag-to-reorder a host card among its same-group siblings (dir: -1/1).
+    callback reorder-session(string /* id */, int /* dir */);
     callback toggle-group(string /* group */);
     callback new-group();
     callback edit-group(string /* current-name */);
@@ -655,10 +705,14 @@ export component Welcome inherits Rectangle {
                             session: session;
                             compact: root.compact;
                             all-sessions: root.sessions;
+                            // Drag-reorder is meaningless while the list is a
+                            // filtered subset, and system rows can't move.
+                            reorder-enabled: root.search-query == "" && !session.builtin;
                             connect => { root.connect-session(session.id); }
                             edit => { root.edit-session(session.id); }
                             duplicate => { root.duplicate-session(session.id); }
                             move-to-group(g) => { root.move-session(session.id, g); }
+                            reorder(dir) => { root.reorder-session(session.id, dir); }
                             remove => { root.remove-session(session.id); }
                         }
                     }
