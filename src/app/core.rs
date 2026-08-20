@@ -6,12 +6,66 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::runtime::Runtime;
 
 use crate::config::ConfigStore;
-use crate::ui::AppWindow;
+use crate::resource::{LocalSnap, NetHist, TabStatuses};
+use crate::sftp::{SftpHandles, SftpLastCwd};
+use crate::ssh::SessionHandle;
+use crate::terminal::{RenderGates, TermBuffers};
+use crate::ui::{
+    AppWindow, PaneInfo, ProcWindow, SplitterInfo, SystemInfoWindow, TabInfo, TerminalState,
+};
+
+/// Where a tab's session events are currently delivered. Session pump
+/// threads hold an `Arc<Mutex<TabRoute>>` per tab and re-read it on every
+/// batch, so moving a tab to another window is just rewriting this struct —
+/// the pumps keep running and immediately target the new window.
+///
+/// Every field is thread-safe (the pumps run off the UI thread).
+#[derive(Clone)]
+pub struct TabRoute {
+    pub window: slint::Weak<AppWindow>,
+    pub window_id: u64,
+    pub bufs: TermBuffers,
+    pub gates: RenderGates,
+    pub statuses: TabStatuses,
+    pub local_snap: LocalSnap,
+    pub net_hist: NetHist,
+    pub sftp_handles: SftpHandles,
+    pub sftp_last_cwd: SftpLastCwd,
+    pub follow_cd: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Tab id → its current delivery route. Shared with the pump threads.
+pub type TabRoutes = Arc<Mutex<HashMap<String, Arc<Mutex<TabRoute>>>>>;
+
+/// Everything another window (or a tab transfer) needs to reach into one
+/// open window. UI-thread-only: every Rc<RefCell> here is borrowed on the
+/// Slint thread exclusively.
+#[derive(Clone)]
+pub struct WindowState {
+    pub weak: slint::Weak<AppWindow>,
+    pub handles: Rc<RefCell<HashMap<String, SessionHandle>>>,
+    pub bufs: TermBuffers,
+    pub gates: RenderGates,
+    pub statuses: TabStatuses,
+    pub sftp_handles: SftpHandles,
+    pub sftp_last_cwd: SftpLastCwd,
+    pub local_snap: LocalSnap,
+    pub net_hist: NetHist,
+    pub follow_cd: Arc<std::sync::atomic::AtomicBool>,
+    pub layout: Rc<RefCell<crate::layout::Layout>>,
+    pub tabs_model: Rc<slint::VecModel<TabInfo>>,
+    pub terminals_model: Rc<slint::VecModel<TerminalState>>,
+    pub panes_model: Rc<slint::VecModel<PaneInfo>>,
+    pub splitters_model: Rc<slint::VecModel<SplitterInfo>>,
+    pub content_size: Rc<Cell<(f32, f32)>>,
+    pub proc_weak: slint::Weak<ProcWindow>,
+    pub sys_weak: slint::Weak<SystemInfoWindow>,
+}
 
 /// Open-window registry, generic over the window handle so it can be unit
 /// tested without constructing Slint components. Production instantiates
@@ -89,6 +143,12 @@ pub struct AppCore {
     pub store: Rc<RefCell<ConfigStore>>,
     /// Live windows; the last one closing quits the shared event loop.
     pub registry: Rc<WindowRegistry<slint::Weak<AppWindow>>>,
+    /// Per-window state reachable across windows (tab detach/merge), keyed
+    /// by the same id the registry hands out. UI-thread-only.
+    pub window_states: Rc<RefCell<HashMap<u64, WindowState>>>,
+    /// Tab id → delivery route, shared with the session pump threads so a
+    /// tab can be retargeted at another window while its pumps keep running.
+    pub tab_routes: TabRoutes,
     /// Set once the first window of the process lifetime finishes opening.
     /// The in-app update check runs only for that window — keying it off
     /// `registry.count() == 1` would re-fire after close-then-open.

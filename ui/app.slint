@@ -500,6 +500,7 @@ export component AppWindow inherits Window {
     }
     callback set-term-font(string);                // apply + persist font family
     callback set-term-font-size(int);              // apply + persist font size (px)
+    callback zoom-term-font(int);                  // Ctrl+=/-/0 zoom: +1 / -1 / reset
     callback set-terminal-line-spacing(float);
     callback set-term-font-bold(bool);             // apply + persist bold terminal text
     callback set-term-cursor-style(string);        // apply + persist cursor shape (#275)
@@ -802,6 +803,10 @@ export component AppWindow inherits Window {
     // Reports the pane-area size to Rust so it can flatten the split tree into
     // absolute pane / splitter rects. Fired whenever the content area resizes.
     callback content-resized(length /* w */, length /* h */);
+    // pane-area origin in window coordinates; tab drag-out converts
+    // drop points to global screen coordinates with this (#tab-detach).
+    out property <length> content-origin-x: pane-area.absolute-position.x;
+    out property <length> content-origin-y: pane-area.absolute-position.y;
     // Asks Rust to recompute the sidebar (status + resources) for whatever tab
     // is now active.  Fired on every active-tab change, UI- or code-driven.
     callback refresh-sidebar();
@@ -914,6 +919,18 @@ export component AppWindow inherits Window {
                     && (e.text == "n" || e.text == "N"
                         || e.text == "\u{000e}")) {
                 root.new-window-clicked();
+                accept
+            // Font zoom: Ctrl+= / Ctrl+- / Ctrl+0 (⌘ on macOS). Same keys as
+            // the focused-terminal branch (terminal_view.slint); a focused
+            // terminal consumes them itself, so no double-fire.
+            } else if (e.modifiers.control && (e.text == "=" || e.text == "+")) {
+                root.zoom-term-font(1);
+                accept
+            } else if (e.modifiers.control && e.text == "-") {
+                root.zoom-term-font(-1);
+                accept
+            } else if (e.modifiers.control && e.text == "0") {
+                root.zoom-term-font(0);
                 accept
             } else {
                 reject
@@ -1491,7 +1508,6 @@ export component AppWindow inherits Window {
                         tab-selected(id) => { root.pane-tab-selected(pane.id, id); }
                         tab-closed(id) => { root.pane-tab-closed(pane.id, id); }
                         new-tab() => { root.pane-new-tab(pane.id); }
-                        new-window() => { root.new-window-clicked(); }
                         tab-reorder(from-index, direction) => {
                             root.pane-tab-reorder(pane.id, from-index, direction);
                         }
@@ -1669,6 +1685,7 @@ export component AppWindow inherits Window {
                         }
                         cycle-tab(reverse) => { root.cycle-tab(reverse); }
                         new-window-key() => { root.new-window-clicked(); }
+                        zoom-key(direction) => { root.zoom-term-font(direction); }
                         terminal-resize(w, h) => { root.terminal-resize(term.id, w, h) }
                         sftp-navigate(path) => { root.sftp-navigate(term.id, path); }
                         sftp-download(path) => { root.sftp-download(term.id, path); }
@@ -3610,12 +3627,20 @@ export component AppWindow inherits Window {
                 ShortcutRow { keys: root.is-mac ? "⌃⇧Tab" : "Ctrl+Shift+Tab"; desc: root.lang-en ? "Previous tab" : "上一个标签页"; }
 
                 Rectangle { height: 6px; }
+                Text { text: root.lang-en ? "Window" : "窗口";
+                       color: Theme.text-muted; font-size: Theme.fs-xs; }
+                ShortcutRow { keys: root.is-mac ? "⌘⇧N" : "Ctrl+Shift+N"; desc: root.lang-en ? "New window" : "新建窗口"; }
+
+                Rectangle { height: 6px; }
                 Text { text: root.lang-en ? "Terminal" : "终端";
                        color: Theme.text-muted; font-size: Theme.fs-xs; }
                 ShortcutRow { keys: root.is-mac ? "⌘C" : "Ctrl+Shift+C"; desc: root.lang-en ? "Copy selection" : "复制选中内容"; }
                 ShortcutRow { keys: root.is-mac ? "⌘V" : "Ctrl+V"; desc: root.lang-en ? "Paste" : "粘贴"; }
                 ShortcutRow { keys: root.is-mac ? "⌘F" : "Ctrl+F"; desc: root.lang-en ? "Find in terminal" : "查找"; }
                 ShortcutRow { keys: root.is-mac ? "⌘⇧R" : "Ctrl+Shift+R"; desc: root.lang-en ? "Jump to command history search" : "跳到命令历史搜索"; }
+                ShortcutRow { keys: root.is-mac ? "⌘=" : "Ctrl+="; desc: root.lang-en ? "Enlarge terminal font" : "放大终端字体"; }
+                ShortcutRow { keys: root.is-mac ? "⌘-" : "Ctrl+-"; desc: root.lang-en ? "Shrink terminal font" : "缩小终端字体"; }
+                ShortcutRow { keys: root.is-mac ? "⌘0" : "Ctrl+0"; desc: root.lang-en ? "Reset terminal font size" : "重置终端字体大小"; }
                 ShortcutRow { keys: root.lang-en ? "Drag" : "鼠标拖动"; desc: root.lang-en ? "Select text" : "选择文本"; }
                 ShortcutRow { keys: root.lang-en ? "Wheel / Scrollbar" : "滚轮 / 滚动条"; desc: root.lang-en ? "Scroll history" : "滚动历史"; }
 

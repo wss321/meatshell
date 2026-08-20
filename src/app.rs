@@ -6,7 +6,7 @@
 //!   * Manage the tab list + per-tab `SessionHandle` map.
 //!   * Route Slint callbacks to the right domain module.
 mod auth_dialogs;
-mod core;
+pub(crate) mod core;
 #[cfg(target_os = "macos")]
 mod dock_menu;
 #[cfg(windows)]
@@ -23,6 +23,7 @@ mod sftp_ui;
 mod sidebar;
 mod single_instance;
 mod tab_callbacks;
+mod tab_transfer;
 mod terminal_ui;
 mod webdav;
 mod window;
@@ -38,6 +39,7 @@ use self::sftp_callbacks::*;
 use self::sftp_ui::*;
 use self::sidebar::*;
 use self::tab_callbacks::*;
+use self::tab_transfer::*;
 use self::terminal_ui::*;
 use self::webdav::*;
 use self::window::*;
@@ -150,7 +152,7 @@ use i_slint_backend_winit::WinitWindowAccessor;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use tokio::runtime::Runtime;
 
-use crate::app::core::{AppCore, WindowRegistry};
+use crate::app::core::{AppCore, TabRoute, TabRoutes, WindowRegistry, WindowState};
 use crate::config::{
     is_reserved_session_group, AuthMethod, ConfigStore, OutputHighlightRule, Secret, Session,
     SessionKind,
@@ -478,6 +480,8 @@ pub fn run(intent: crate::app::launch::LaunchIntent) -> Result<()> {
         runtime,
         store,
         registry: Rc::new(WindowRegistry::default()),
+        window_states: Rc::new(RefCell::new(HashMap::new())),
+        tab_routes: Arc::new(Mutex::new(HashMap::new())),
         first_window_done: Cell::new(false),
     });
 
@@ -522,13 +526,13 @@ pub fn run(intent: crate::app::launch::LaunchIntent) -> Result<()> {
     {
         let core = core.clone();
         set_new_window_hook(Rc::new(move || {
-            if let Err(e) = open_window(core.clone(), true) {
+            if let Err(e) = open_window(core.clone(), true, None) {
                 tracing::warn!("failed to open new window: {e:#}");
             }
         }));
     }
 
-    open_window(core.clone(), false)?;
+    open_window(core.clone(), false, None)?;
 
     #[cfg(target_os = "macos")]
     crate::app::dock_menu::install_dock_menu();
@@ -549,7 +553,7 @@ pub fn run(intent: crate::app::launch::LaunchIntent) -> Result<()> {
             std::time::Duration::from_millis(250),
             move || {
                 while rx.try_recv().is_ok() {
-                    if let Err(e) = open_window(core.clone(), true) {
+                    if let Err(e) = open_window(core.clone(), true, None) {
                         tracing::warn!("failed to open forwarded window: {e:#}");
                     }
                 }
@@ -567,8 +571,14 @@ pub fn run(intent: crate::app::launch::LaunchIntent) -> Result<()> {
 
 /// Build and wire one application window. Called for the first window by
 /// `run()` and for every subsequent window by the new-window entry points.
+/// `at` pins the window to a physical screen position (tab detach); without
+/// it the window cascades from the newest one or centers.
 /// Returns the registry id used to unregister on close.
-fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
+fn open_window(
+    core: Rc<AppCore>,
+    cascade: bool,
+    at: Option<slint::PhysicalPosition>,
+) -> Result<u64> {
     let runtime = core.runtime.clone();
     let store = core.store.clone();
     let registry = core.registry.clone();
@@ -1358,6 +1368,30 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
         });
     }
     {
+        // Font zoom shortcuts (Ctrl+= / Ctrl+- / Ctrl+0). direction:
+        // +1 larger, -1 smaller, 0 = reset to the 13px default. Reuses the
+        // settings stepper's persist path; the Theme.term-font-size change
+        // re-measures the cell grid and triggers the PTY resize on its own.
+        let weak = window.as_weak();
+        let store = store.clone();
+        window.on_zoom_term_font(move |direction: i32| {
+            let next = {
+                let mut s = store.borrow_mut();
+                let next = if direction == 0 {
+                    13
+                } else {
+                    s.font_size() as i32 + direction
+                };
+                s.set_font_size(next.clamp(8, 32) as u32);
+                let _ = s.save();
+                s.font_size()
+            };
+            if let Some(w) = weak.upgrade() {
+                w.set_term_font_size(next as f32);
+            }
+        });
+    }
+    {
         let store = store.clone();
         window.on_persist_sftp_tree_width(move |width| {
             let mut s = store.borrow_mut();
@@ -1792,6 +1826,32 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
     let local_snap: LocalSnap = Arc::new(Mutex::new(SystemSnapshot::default()));
     let local_net_hist: NetHist = Arc::new(Mutex::new(vec![0.0; NET_HISTORY_LEN]));
 
+    // Expose this window's state to the rest of the process so tabs can be
+    // dragged out into a new window or merged into another one (#tab-detach).
+    core.window_states.borrow_mut().insert(
+        window_id,
+        WindowState {
+            weak: window.as_weak(),
+            handles: handles.clone(),
+            bufs: bufs.clone(),
+            gates: render_gates.clone(),
+            statuses: tab_statuses.clone(),
+            sftp_handles: sftp_handles.clone(),
+            sftp_last_cwd: sftp_last_cwd.clone(),
+            local_snap: local_snap.clone(),
+            net_hist: local_net_hist.clone(),
+            follow_cd: sftp_follow_cd.clone(),
+            layout: layout.clone(),
+            tabs_model: tabs_model.clone(),
+            terminals_model: terminals_model.clone(),
+            panes_model: panes_model.clone(),
+            splitters_model: splitters_model.clone(),
+            content_size: content_size.clone(),
+            proc_weak: proc_win.as_weak(),
+            sys_weak: sys_win.as_weak(),
+        },
+    );
+
     {
         let proc_weak = proc_win.as_weak();
         let handles = handles.clone();
@@ -1897,6 +1957,7 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
         local_snap.clone(),
         local_net_hist.clone(),
         sftp_follow_cd.clone(),
+        core.tab_routes.clone(),
     );
 
     // Recompute the sidebar whenever the active tab changes (fired from Slint's
@@ -2256,7 +2317,7 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
     {
         let core = core.clone();
         window.on_new_window_clicked(move || {
-            if let Err(e) = open_window(core.clone(), true) {
+            if let Err(e) = open_window(core.clone(), true, None) {
                 tracing::warn!("failed to open new window: {e:#}");
             }
         });
@@ -2264,6 +2325,8 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
 
     wire_tab_callbacks(
         &window,
+        window_id,
+        core.clone(),
         tabs_model.clone(),
         terminals_model.clone(),
         layout.clone(),
@@ -2298,6 +2361,7 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
             last_term_size: last_term_size.clone(),
             sftp_follow_cd: sftp_follow_cd.clone(),
             store: store.clone(),
+            tab_routes: core.tab_routes.clone(),
         },
     );
 
@@ -2389,6 +2453,7 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
         let ev_activity = activity.clone();
         let ev_exit_confirmed = exit_confirmed.clone();
         let ev_registry = registry.clone();
+        let ev_core = core.clone();
         let ev_window_size_tracking_ready = window_size_tracking_ready.clone();
         let ev_pending_window_size_restore = pending_window_size_restore.clone();
         let mut last_cursor_logical: Option<(f32, f32)> = None;
@@ -2696,6 +2761,7 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
                         if ev_registry.unregister(window_id) {
                             let _ = slint::quit_event_loop();
                         }
+                        forget_window_state(&ev_core, window_id);
                     }
                     _ => {}
                 }
@@ -2712,6 +2778,7 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
         let close_sftp_handles = sftp_handles.clone();
         let close_exit_confirmed = exit_confirmed.clone();
         let close_registry = registry.clone();
+        let close_core = core.clone();
         window.on_confirm_close_yes(move || {
             // Guard against a double click and against another close request
             // arriving from Windows Installer while shutdown is in progress.
@@ -2737,6 +2804,7 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
             if close_registry.unregister(window_id) {
                 let _ = slint::quit_event_loop();
             }
+            forget_window_state(&close_core, window_id);
         });
     }
 
@@ -2773,6 +2841,7 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
         let wc_store = store.clone();
         let wc_exit_confirmed = exit_confirmed.clone();
         let wc_registry = registry.clone();
+        let wc_core = core.clone();
         window.on_win_close(move || {
             if let Some(w) = weak.upgrade() {
                 // Mirror the native-X behaviour: confirm if sessions are open.
@@ -2793,6 +2862,7 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
                     if wc_registry.unregister(window_id) {
                         let _ = slint::quit_event_loop();
                     }
+                    forget_window_state(&wc_core, window_id);
                 } else {
                     w.set_confirm_close_open(true);
                 }
@@ -2845,6 +2915,11 @@ fn open_window(core: Rc<AppCore>, cascade: bool) -> Result<u64> {
             .map(|w| w.window().position());
         slint::Timer::single_shot(std::time::Duration::from_millis(30), move || {
             let Some(w) = weak.upgrade() else { return };
+            if let Some(pos) = at {
+                // Tab detach pinned the window under the cursor (#tab-detach).
+                w.window().set_position(pos);
+                return;
+            }
             match origin {
                 Some(pos) => {
                     w.window().set_position(slint::PhysicalPosition::new(
@@ -3316,6 +3391,7 @@ fn wire_session_callbacks(
     local_snap: LocalSnap,
     local_net_hist: NetHist,
     sftp_follow_cd: Arc<std::sync::atomic::AtomicBool>,
+    tab_routes: TabRoutes,
 ) {
     // Working set of port forwards (#56) for the session being created/edited.
     // The forward add/delete callbacks mutate it; saving reads it into
@@ -4215,6 +4291,7 @@ fn wire_session_callbacks(
         let local_snap = local_snap.clone();
         let local_net_hist = local_net_hist.clone();
         let sftp_follow_cd = sftp_follow_cd.clone();
+        let tab_routes = tab_routes.clone();
         window.on_connect_session(move |id: SharedString| {
             let id = id.to_string();
             let session = if id.starts_with("system:") {
@@ -4391,6 +4468,7 @@ fn wire_session_callbacks(
                 last_term_size: last_term_size.clone(),
                 sftp_follow_cd: sftp_follow_cd.clone(),
                 store: store.clone(),
+                tab_routes: tab_routes.clone(),
             };
             start_session_in_tab(&tab_id, session, &ctx);
         });

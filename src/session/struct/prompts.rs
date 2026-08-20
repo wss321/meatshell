@@ -33,6 +33,10 @@ pub(crate) struct ConnectCtx {
     pub(crate) last_term_size: Arc<Mutex<(u32, u32)>>,
     pub(crate) sftp_follow_cd: Arc<AtomicBool>,
     pub(crate) store: Rc<RefCell<ConfigStore>>,
+    /// Process-wide tab delivery routes. Starting a session registers its
+    /// route here so a later detach/merge can retarget the running pumps
+    /// at another window without respawning them (#tab-detach).
+    pub(crate) tab_routes: crate::app::core::TabRoutes,
 }
 
 pub(crate) struct PendingHostKey {
