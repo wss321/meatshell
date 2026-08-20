@@ -2794,6 +2794,7 @@ fn open_window(
                         // No sessions → the window is about to close; persist layout.
                         if let Some(win) = weak.upgrade() {
                             save_layout(&win, &ev_store);
+                            clear_zen_on_close(&win, &ev_store);
                         }
                         // The event is not prevented, so Slint will destroy this
                         // window. Mirror the confirmed custom-close path: tear down
@@ -2837,6 +2838,7 @@ fn open_window(
             if let Some(w) = weak.upgrade() {
                 w.set_confirm_close_open(false);
                 save_layout(&w, &cc_store);
+                clear_zen_on_close(&w, &cc_store);
                 let _ = w.hide();
             }
             // Ask every worker to stop before the runtime/event loop is torn
@@ -2898,6 +2900,7 @@ fn open_window(
                 {
                     wc_exit_confirmed.set(true);
                     save_layout(&w, &wc_store);
+                    clear_zen_on_close(&w, &wc_store);
                     // Tear down this window's workers and hide its monitor
                     // windows; quit only if it was the last one.
                     teardown_window(
@@ -4592,6 +4595,19 @@ fn save_layout(win: &AppWindow, store: &Rc<RefCell<ConfigStore>>) {
         // do not issue a new native resize while the window is shutting down.
         s.set_window_size(w, h);
     }
+    let _ = s.save();
+}
+
+/// Zen is a transient per-window state. Closing a window while it is on must
+/// not leak the persisted flag into the next window, which would open stuck in
+/// zen mode (#zen). Called on every confirmed-close path right after
+/// `save_layout`.
+pub(super) fn clear_zen_on_close(win: &AppWindow, store: &Rc<RefCell<ConfigStore>>) {
+    if !win.get_zen_mode() {
+        return;
+    }
+    let mut s = store.borrow_mut();
+    s.set_zen_mode(false);
     let _ = s.save();
 }
 

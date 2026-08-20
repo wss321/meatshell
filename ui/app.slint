@@ -909,6 +909,12 @@ export component AppWindow inherits Window {
     toggle-zen-key => {
         root.zen-mode = !root.zen-mode;
         root.set-zen-mode(root.zen-mode);
+        // Entering zen with no terminals can leave nothing focused (the
+        // welcome page may be hidden as a sidebar), which would strand the
+        // Ctrl+Alt+Z escape shortcut — anchor focus on the shortcut scope.
+        if (root.zen-mode && root.terminals.length == 0) {
+            shortcut-scope.focus();
+        }
     }
 
     // Window-wide shortcut interceptor (#multi-window). Slint delivers a key
@@ -922,9 +928,27 @@ export component AppWindow inherits Window {
     // other widget. A focused terminal accepts ⌘⇧N / Ctrl+Shift+N on its own
     // (terminal_view.slint), which stops propagation, so the two never
     // double-fire.
-    FocusScope {
+    shortcut-scope := FocusScope {
         focus-on-click: false;
         focus-on-tab-navigation: false;
+        // A window restored into zen mode starts with nothing focused when no
+        // focusable widget is on screen (e.g. the welcome page is hidden as a
+        // sidebar and no terminal exists yet). Slint delivers keys only to the
+        // focused item, so the Ctrl+Alt+Z escape shortcut would be stranded in
+        // exactly that stuck state. Claim focus on the next event-loop turn —
+        // deferred like the welcome scope so AccessKit/winit aren't re-entered
+        // from `init` (#323); any real widget that takes focus later (welcome
+        // page, terminal IME anchor) simply overrides this.
+        property <bool> zen-focus-pending: false;
+        init => { shortcut-scope.zen-focus-pending = root.zen-mode && root.terminals.length == 0; }
+        Timer {
+            interval: 0ms;
+            running: shortcut-scope.zen-focus-pending;
+            triggered => {
+                shortcut-scope.zen-focus-pending = false;
+                shortcut-scope.focus();
+            }
+        }
         key-pressed(e) => {
             // New window: ⌘⇧N / Ctrl+Shift+N (#multi-window). On macOS Slint
             // maps `control` to Cmd (#158), so this single condition yields ⌘⇧N
