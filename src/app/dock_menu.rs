@@ -1,17 +1,20 @@
 //! macOS Dock menu: right-click the Dock icon → "新建窗口".
 //!
-//! winit (which Slint uses) sets an `NSApplication` delegate that does not
-//! implement `applicationDockMenu:`, so macOS falls back to querying the
-//! `NSApplication` object itself. At startup we therefore add two methods to
-//! the `NSApplication` class at runtime with `class_addMethod`:
+//! AppKit asks the application delegate for `applicationDockMenu:`; while
+//! winit's delegate is installed it does not fall back to `NSApplication`
+//! itself (verified on macOS — patching `NSApplication` left the Dock menu
+//! default). We therefore add two methods to the delegate's class at
+//! runtime with `class_addMethod` (falling back to the `NSApplication`
+//! class only when no delegate exists yet):
 //!
 //! * `applicationDockMenu:` — builds and returns the Dock menu (a single
 //!   "新建窗口" entry). The menu is constructed fresh on every request and
 //!   autoreleased, matching AppKit's expectation that the returned menu is
 //!   not owned by the Dock.
-//! * `meatshellNewWindow:` — the menu item's action (target = the
-//!   `NSApplication` instance). It routes into `crate::app::request_new_window()`,
-//!   which opens a new window through the hook `run()` installs.
+//! * `meatshellNewWindow:` — the menu item's action (target = the receiver
+//!   of `applicationDockMenu:`, i.e. the same object whose class we
+//!   patched). It routes into `crate::app::request_new_window()`, which
+//!   opens a new window through the hook `run()` installs.
 //!
 //! Threading: the Dock menu is only requested on the main thread, which is
 //! also Slint's UI thread in this app, so the action handler can open the
@@ -22,7 +25,7 @@ use std::ffi::c_char;
 use objc2::ffi::class_addMethod;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Imp, Sel};
-use objc2::{sel, ClassType, MainThreadMarker, MainThreadOnly};
+use objc2::{msg_send, sel, ClassType, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{NSApplication, NSMenu, NSMenuItem};
 use objc2_foundation::NSString;
 
@@ -31,20 +34,34 @@ type DockMenuFn = unsafe extern "C-unwind" fn(&AnyObject, Sel, &AnyObject) -> *m
 /// `meatshellNewWindow:` implementation: `fn(id self, SEL _cmd, id sender) -> void`.
 type NewWindowFn = unsafe extern "C-unwind" fn(&AnyObject, Sel, &AnyObject);
 
-/// Add `applicationDockMenu:` and `meatshellNewWindow:` to the NSApplication
-/// class. Called from `run()` on the main thread, before the first window is
-/// shown. Failures are logged and swallowed — a missing Dock entry must never
-/// keep the app from starting.
+/// Add `applicationDockMenu:` and `meatshellNewWindow:` where AppKit will
+/// actually look for them. AppKit asks the application DELEGATE for
+/// `applicationDockMenu:` first, and while winit's delegate is installed it
+/// never falls back to the `NSApplication` class (verified on macOS:
+/// patching `NSApplication` left the Dock menu default). So patch the
+/// delegate's class; only if no delegate exists yet fall back to
+/// `NSApplication`. Call this after the first window is created, which is
+/// when winit has set up the delegate. Failures are logged and swallowed —
+/// a missing Dock entry must never keep the app from starting.
 pub fn install_dock_menu() {
     // Defensive: class patching happens once at startup on the main thread,
     // where `run()` executes. Bail out instead of touching AppKit off-main.
-    if MainThreadMarker::new().is_none() {
+    let Some(mtm) = MainThreadMarker::new() else {
         tracing::warn!("dock menu install skipped: not on the main thread");
         return;
-    }
+    };
 
     unsafe {
-        let cls: *mut AnyClass = (NSApplication::class() as *const AnyClass).cast_mut();
+        let app = NSApplication::sharedApplication(mtm);
+        // Raw runtime lookup: AppKit's -[NSApplication delegate], then the
+        // delegate instance's class. Going through msg_send sidesteps the
+        // ProtocolObject type gymnastics entirely.
+        let delegate: *mut AnyObject = msg_send![&app, delegate];
+        let cls: *mut AnyClass = if delegate.is_null() {
+            (NSApplication::class() as *const AnyClass).cast_mut()
+        } else {
+            msg_send![delegate, class]
+        };
 
         // SAFETY: `Imp` is an argument-less `unsafe extern "C-unwind" fn()`;
         // the runtime passes self/_cmd/sender per the type encoding given to

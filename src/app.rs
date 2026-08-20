@@ -513,8 +513,11 @@ pub fn run(intent: crate::app::launch::LaunchIntent) -> Result<()> {
     crate::app::jump_list::register_new_window_task();
 
     // macOS Dock menu ("新建窗口"): install the new-window hook first so a
-    // Dock click can never race ahead of it, then patch NSApplication.
-    // Failures are warn-only and never block startup (see dock_menu.rs).
+    // Dock click can never race ahead of it. The NSApplication patching
+    // itself happens after the first window below, because AppKit asks the
+    // winit delegate for the Dock menu and that delegate only exists once
+    // the backend has built a window. Failures are warn-only and never
+    // block startup (see dock_menu.rs).
     #[cfg(target_os = "macos")]
     {
         let core = core.clone();
@@ -523,10 +526,12 @@ pub fn run(intent: crate::app::launch::LaunchIntent) -> Result<()> {
                 tracing::warn!("failed to open new window: {e:#}");
             }
         }));
-        crate::app::dock_menu::install_dock_menu();
     }
 
     open_window(core.clone(), false)?;
+
+    #[cfg(target_os = "macos")]
+    crate::app::dock_menu::install_dock_menu();
 
     // UI-thread drain for forwarded new-window requests: the IPC listener
     // above sends one () per request; this repeating timer picks them up on
