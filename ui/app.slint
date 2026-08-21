@@ -827,7 +827,17 @@ export component AppWindow inherits Window {
     // Asks Rust to recompute the sidebar (status + resources) for whatever tab
     // is now active.  Fired on every active-tab change, UI- or code-driven.
     callback refresh-sidebar();
-    changed active-tab-id => { root.refresh-sidebar(); }
+    changed active-tab-id => {
+        root.refresh-sidebar();
+        // Closing the last session destroys the terminal's IME focus anchor
+        // and nothing else re-claims focus — with no focused item, Slint
+        // delivers keys nowhere, stranding the zen escape shortcut (and every
+        // window-level shortcut). Re-anchor on the shortcut scope whenever the
+        // welcome tab is active and no terminal remains.
+        if (root.active-tab-id == "welcome" && root.terminals.length == 0) {
+            shortcut-scope.focus();
+        }
+    }
 
     // Raw keystroke forwarding: Rust converts key+modifiers to PTY bytes.
     callback send-key(string /* tab-id */, string /* key */, bool /* ctrl */, bool /* alt */, bool /* shift */);
