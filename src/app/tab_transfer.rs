@@ -75,8 +75,12 @@ fn find_tab_row(st: &WindowState, tab_id: &str) -> Option<TabInfo> {
     st.tabs_model.iter().find(|t| t.id.to_string() == tab_id)
 }
 
-/// Can this tab be moved? Only connected terminal tabs: welcome has no
-/// session, and a mid-auth tab still has prompts routed to its window.
+/// Can this tab be moved? Any terminal tab that owns a session handle and is
+/// not still connecting: connected tabs keep their live connection, and
+/// disconnected tabs (state 2) can be torn off and reconnected in the new
+/// window (Enter-to-reconnect, #79). Excluded: the welcome tab (no session)
+/// and mid-connect/mid-auth tabs, whose prompts are still routed to this
+/// window.
 fn movable(core: &Rc<AppCore>, window_id: u64, tab_id: &str) -> bool {
     let states = core.window_states.borrow();
     let Some(st) = states.get(&window_id) else {
@@ -85,7 +89,19 @@ fn movable(core: &Rc<AppCore>, window_id: u64, tab_id: &str) -> bool {
     let Some(row) = find_tab_row(st, tab_id) else {
         return false;
     };
-    row.kind.to_string() == "terminal" && row.connected && st.handles.borrow().contains_key(tab_id)
+    row.kind.to_string() == "terminal"
+        && st.handles.borrow().contains_key(tab_id)
+        && !tab_connecting(st, tab_id)
+}
+
+/// TabStatus state 0 = still connecting/authenticating; 1 = connected;
+/// 2 = disconnected. A missing entry means the session never reported —
+/// treat it as still connecting.
+fn tab_connecting(st: &WindowState, tab_id: &str) -> bool {
+    st.statuses
+        .lock()
+        .map(|m| m.get(tab_id).map(|s| s.state).unwrap_or(0) == 0)
+        .unwrap_or(true)
 }
 
 /// Highlight a window's content area as a merge target.
@@ -199,6 +215,7 @@ pub(super) fn handle_global_tab_drag_drop(
     clear_all_highlights(core);
 
     let Some((gx, gy)) = global_point(core, window_id, x, y) else {
+        tracing::warn!("tab-drop: global_point failed (window {window_id}, local {x},{y})");
         return false;
     };
     let over_src = {
@@ -209,6 +226,10 @@ pub(super) fn handle_global_tab_drag_drop(
             .map(|w| contains(&win_geo(&w), gx, gy))
             .unwrap_or(true)
     };
+    tracing::warn!(
+        "tab-drop: tab={tab_id} global=({gx},{gy}) over_src={over_src} movable={}",
+        movable(core, window_id, tab_id)
+    );
 
     // A drop inside the source window always keeps the in-window pane
     // split/move logic, even if another window's rect overlaps underneath
@@ -218,6 +239,7 @@ pub(super) fn handle_global_tab_drag_drop(
     }
     // Merge into whichever other window received the drop.
     if let Some(dst) = window_over(core, window_id, gx, gy) {
+        tracing::warn!("tab-drop: merge into window {dst}");
         if movable(core, window_id, tab_id) {
             move_tab_between_windows(core, window_id, dst, tab_id);
         }
@@ -225,6 +247,7 @@ pub(super) fn handle_global_tab_drag_drop(
     }
     // Empty desktop: tear off into a new window at the drop point.
     if !movable(core, window_id, tab_id) {
+        tracing::warn!("tab-drop: not movable, detach skipped");
         return true;
     }
     let Some(src_win) = core
@@ -233,32 +256,40 @@ pub(super) fn handle_global_tab_drag_drop(
         .get(&window_id)
         .and_then(|st| st.weak.upgrade())
     else {
+        tracing::warn!("tab-drop: source window gone");
         return true;
     };
     let at = clamped_detach_position(&src_win, gx, gy);
-    if let Ok(new_id) = open_window(core.clone(), false, Some(at)) {
-        {
-            // The fresh window opens with a welcome tab; the detached
-            // session takes its place.
+    match open_window(core.clone(), false, Some(at)) {
+        Ok(new_id) => {
+            tracing::warn!("tab-drop: detach into new window {new_id}");
             {
-                let states = core.window_states.borrow();
-                if let Some(st) = states.get(&new_id) {
-                    use slint::Model as _;
-                    if let Some(i) = st
-                        .tabs_model
-                        .iter()
-                        .position(|t| t.id.to_string() == "welcome")
-                    {
-                        st.tabs_model.remove(i);
+                // The fresh window opens with a welcome tab; the detached
+                // session takes its place.
+                {
+                    let states = core.window_states.borrow();
+                    if let Some(st) = states.get(&new_id) {
+                        use slint::Model as _;
+                        if let Some(i) = st
+                            .tabs_model
+                            .iter()
+                            .position(|t| t.id.to_string() == "welcome")
+                        {
+                            st.tabs_model.remove(i);
+                        }
+                        st.layout.borrow_mut().remove_tab("welcome");
                     }
-                    st.layout.borrow_mut().remove_tab("welcome");
+                }
+                let moved = move_tab_between_windows(core, window_id, new_id, tab_id);
+                let left = window_tab_count(core, window_id);
+                tracing::warn!("tab-drop: moved={moved} source tabs left={left}");
+                if moved && left == 0 {
+                    close_window_now(core, window_id);
                 }
             }
-            if move_tab_between_windows(core, window_id, new_id, tab_id)
-                && window_tab_count(core, window_id) == 0
-            {
-                close_window_now(core, window_id);
-            }
+        }
+        Err(err) => {
+            tracing::warn!("tab-drop: open_window failed: {err:#}");
         }
     }
     true
@@ -329,8 +360,8 @@ pub(super) fn move_tab_between_windows(
             return false;
         };
         if row.kind.to_string() != "terminal"
-            || !row.connected
             || !src.handles.borrow().contains_key(tab_id)
+            || tab_connecting(&src, tab_id)
         {
             return false;
         }
