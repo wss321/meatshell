@@ -292,12 +292,19 @@ fn clamped_detach_position(src_win: &AppWindow, gx: f32, gy: f32) -> slint::Phys
     slint::PhysicalPosition::new((left * scale) as i32, (top * scale) as i32)
 }
 
+/// Terminal-tab count of a window (welcome tab excluded): a window torn empty
+/// by a tab detach should close even though its welcome tab remains.
 fn window_tab_count(core: &Rc<AppCore>, window_id: u64) -> usize {
     use slint::Model as _;
     core.window_states
         .borrow()
         .get(&window_id)
-        .map(|st| st.tabs_model.iter().count())
+        .map(|st| {
+            st.tabs_model
+                .iter()
+                .filter(|t| t.id.as_str() != "welcome")
+                .count()
+        })
         .unwrap_or(0)
 }
 
