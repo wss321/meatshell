@@ -766,6 +766,7 @@ export component AppWindow inherits Window {
     callback duplicate-session(string /* session-id */);
     callback move-session(string /* session-id */, string /* group */);
     callback reorder-session(string /* session-id */, int /* dir: -1 up, 1 down */);
+    callback reorder-session-end();
     callback toggle-group(string /* group */);
     callback remove-session(string /* session-id */);
     callback session-dialog-submit(SessionDraft);
@@ -1258,6 +1259,7 @@ export component AppWindow inherits Window {
                     duplicate-session(id) => { root.duplicate-session(id); }
                     move-session(id, group) => { root.move-session(id, group); }
                     reorder-session(id, dir) => { root.reorder-session(id, dir); }
+                    reorder-end => { root.reorder-session-end(); }
                     toggle-group(group) => { root.toggle-group(group); }
                     new-group => {
                         root.group-dialog-orig = "";
@@ -1630,6 +1632,7 @@ export component AppWindow inherits Window {
                         duplicate-session(id) => { root.duplicate-session(id); }
                         move-session(id, group) => { root.move-session(id, group); }
                         reorder-session(id, dir) => { root.reorder-session(id, dir); }
+                        reorder-end => { root.reorder-session-end(); }
                         toggle-group(group) => { root.toggle-group(group); }
                         new-group => {
                             root.group-dialog-orig = "";
