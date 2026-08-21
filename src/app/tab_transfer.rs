@@ -75,12 +75,13 @@ fn find_tab_row(st: &WindowState, tab_id: &str) -> Option<TabInfo> {
     st.tabs_model.iter().find(|t| t.id.to_string() == tab_id)
 }
 
-/// Can this tab be moved? Any terminal tab that owns a session handle and is
-/// not still connecting: connected tabs keep their live connection, and
-/// disconnected tabs (state 2) can be torn off and reconnected in the new
-/// window (Enter-to-reconnect, #79). Excluded: the welcome tab (no session)
-/// and mid-connect/mid-auth tabs, whose prompts are still routed to this
-/// window.
+/// Can this tab be moved? Any terminal tab that owns a session handle, in
+/// any connection state: connected tabs keep their live connection,
+/// disconnected tabs (state 2) reconnect in the new window (Enter-to-
+/// reconnect, #79), and mid-connect tabs keep connecting because every
+/// event (including auth prompts) is delivered through the per-tab
+/// `TabRoute`, which the move retargets at the new window. Excluded: the
+/// welcome tab (no session).
 fn movable(core: &Rc<AppCore>, window_id: u64, tab_id: &str) -> bool {
     let states = core.window_states.borrow();
     let Some(st) = states.get(&window_id) else {
@@ -89,19 +90,7 @@ fn movable(core: &Rc<AppCore>, window_id: u64, tab_id: &str) -> bool {
     let Some(row) = find_tab_row(st, tab_id) else {
         return false;
     };
-    row.kind.to_string() == "terminal"
-        && st.handles.borrow().contains_key(tab_id)
-        && !tab_connecting(st, tab_id)
-}
-
-/// TabStatus state 0 = still connecting/authenticating; 1 = connected;
-/// 2 = disconnected. A missing entry means the session never reported —
-/// treat it as still connecting.
-fn tab_connecting(st: &WindowState, tab_id: &str) -> bool {
-    st.statuses
-        .lock()
-        .map(|m| m.get(tab_id).map(|s| s.state).unwrap_or(0) == 0)
-        .unwrap_or(true)
+    row.kind.to_string() == "terminal" && st.handles.borrow().contains_key(tab_id)
 }
 
 /// Highlight a window's content area as a merge target.
@@ -241,7 +230,12 @@ pub(super) fn handle_global_tab_drag_drop(
     if let Some(dst) = window_over(core, window_id, gx, gy) {
         tracing::warn!("tab-drop: merge into window {dst}");
         if movable(core, window_id, tab_id) {
-            move_tab_between_windows(core, window_id, dst, tab_id);
+            let moved = move_tab_between_windows(core, window_id, dst, tab_id);
+            // A window emptied by the merge closes itself, exactly like the
+            // desktop-detach path below.
+            if moved && window_tab_count(core, window_id) == 0 {
+                close_window_now(core, window_id);
+            }
         }
         return true;
     }
@@ -359,10 +353,7 @@ pub(super) fn move_tab_between_windows(
         let Some(row) = find_tab_row(&src, tab_id) else {
             return false;
         };
-        if row.kind.to_string() != "terminal"
-            || !src.handles.borrow().contains_key(tab_id)
-            || tab_connecting(&src, tab_id)
-        {
+        if row.kind.to_string() != "terminal" || !src.handles.borrow().contains_key(tab_id) {
             return false;
         }
         (src, dst)
